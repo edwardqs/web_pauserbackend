@@ -42,7 +42,7 @@ model User {
   name          String?
   roleId        Int       @default(2)
   sedeId        Int?
-  unidadId      Int?
+  unidadId     Int?
   cargoId       Int?
   role          Role      @relation(fields: [roleId], references: [id])
   sede          Sede?     @relation(fields: [sedeId], references: [id])
@@ -52,6 +52,7 @@ model User {
   evaluations   Evaluation[]
   campaigns     CampaignUser[]
   programs      UserProgram[]
+  answersReviewed Answer[]  @relation("AnswerReviewer")
 }
 
 model Campaign {
@@ -133,12 +134,14 @@ model Evaluation {
   userId      Int
   campaignId  Int
   source      String    @default("EXCELENCIA")  // EXCELENCIA, MIS_PROGRAMAS
+  programId   Int?      // Programa relacionado (para MIS_PROGRAMAS)
   totalScore  Int       @default(0)
   maxScore    Int       @default(0) // puntaje máximo posible
   completedAt DateTime?
   createdAt   DateTime  @default(now())
   user        User      @relation(fields: [userId], references: [id])
   campaign    Campaign  @relation(fields: [campaignId], references: [id])
+  program     Program?  @relation(fields: [programId], references: [id])
   answers     Answer[]
 
   @@unique([userId, campaignId, source])
@@ -152,10 +155,17 @@ model Answer {
   awardedScore   Int        @default(0)
   hasEvidence    Boolean    @default(false)
   createdAt      DateTime   @default(now())
-  evaluation    Evaluation @relation(fields: [evaluationId], references: [id], onDelete: Cascade)
+  // Campos de revisión por admin
+  adminScore     Int?       // Puntaje final dado por admin (por pregunta)
+  adminComment   String?    // Comentario del admin
+  adminReviewedAt DateTime? // Cuándo fue revisado
+  reviewedById   Int?       // FK al admin que revisó (User.id)
+  // Relaciones
+  evaluation     Evaluation @relation(fields: [evaluationId], references: [id], onDelete: Cascade)
   question       Question   @relation(fields: [questionId], references: [id])
   option         QuestionOption? @relation(fields: [optionId], references: [id])
   files          AnswerFile[]
+  reviewedBy     User?      @relation("AnswerReviewer", fields: [reviewedById], references: [id])
 
   @@unique([evaluationId, questionId])
 }
@@ -194,6 +204,7 @@ model Program {
   createdAt   DateTime  @default(now())
   users       UserProgram[]
   questions   QuestionProgram[]
+  evaluations Evaluation[]
 }
 
 model UserProgram {

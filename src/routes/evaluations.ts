@@ -665,4 +665,224 @@ router.get("/my-result", authMiddleware, async (req: AuthRequest, res) => {
   }
 });
 
+// ==================== EVALUACIONES - LISTAR TODAS ====================
+router.get("/all", authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    if (req.user?.roleId !== 1) {
+      return res.status(403).json({ error: "Solo admins pueden ver todas las evaluaciones" });
+    }
+
+    const { source, programId, userId, campaignId } = req.query;
+
+    const where: any = {};
+    if (source) where.source = source as string;
+    if (programId) where.programId = parseInt(programId as string);
+    if (userId) where.userId = parseInt(userId as string);
+    if (campaignId) where.campaignId = parseInt(campaignId as string);
+
+    const evaluations = await prisma.evaluation.findMany({
+      where,
+      include: {
+        user: { select: { id: true, name: true, email: true, cargo: { select: { name: true } } } },
+        campaign: { select: { id: true, name: true } },
+        program: { select: { id: true, name: true } },
+        answers: { select: { id: true, questionId: true, awardedScore: true, adminScore: true } },
+      },
+      orderBy: { createdAt: "desc" },
+    });
+
+    const result = evaluations.map((ev) => {
+      const autoScore = ev.answers.reduce((sum, a) => sum + (a.awardedScore || 0), 0);
+      const adminScore = ev.answers.reduce((sum, a) => sum + (a.adminScore || 0), 0);
+      const reviewedCount = ev.answers.filter((a) => a.adminScore !== null).length;
+      
+      return {
+        ...ev,
+        autoScore,
+        adminScore: adminScore > 0 ? adminScore : null,
+        reviewedCount,
+        totalAnswers: ev.answers.length,
+        isComplete: ev.completedAt !== null,
+      };
+    });
+
+    res.json(result);
+  } catch (error) {
+    console.error("Error al listar evaluaciones:", error);
+    res.status(500).json({ error: "Error al listar evaluaciones" });
+  }
+});
+
+// ==================== EVALUACIONES - DETALLE COMPLETO ====================
+router.get("/:id/details", authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    if (req.user?.roleId !== 1) {
+      return res.status(403).json({ error: "Solo admins pueden ver detalles" });
+    }
+
+    const evaluationId = parseInt(req.params.id);
+
+    const evaluation = await prisma.evaluation.findUnique({
+      where: { id: evaluationId },
+      include: {
+        user: { include: { cargo: true, sede: true } },
+        campaign: true,
+        program: true,
+        answers: {
+          include: {
+            question: { include: { options: true } },
+            option: true,
+            files: true,
+            reviewedBy: { select: { id: true, name: true } },
+          },
+          orderBy: { question: { order: "asc" } },
+        },
+      },
+    });
+
+    if (!evaluation) {
+      return res.status(404).json({ error: "Evaluación no encontrada" });
+    }
+
+    // Calculate totals
+    const autoScore = evaluation.answers.reduce((sum, a) => sum + (a.awardedScore || 0), 0);
+    const adminScore = evaluation.answers.reduce((sum, a) => sum + (a.adminScore || 0), 0);
+
+    res.json({
+      ...evaluation,
+      autoScore,
+      adminScore,
+    });
+  } catch (error) {
+    console.error("Error al obtener detalles:", error);
+    res.status(500).json({ error: "Error al obtener detalles" });
+  }
+});
+
+// ==================== EVALUACIONES - HISTORIAL POR USUARIO ====================
+router.get("/user/:userId/history", authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    if (req.user?.roleId !== 1 && req.user?.id !== parseInt(req.params.userId)) {
+      return res.status(403).json({ error: "Sin permisos" });
+    }
+
+    const userId = parseInt(req.params.userId);
+
+    const evaluations = await prisma.evaluation.findMany({
+      where: { userId },
+      include: {
+        campaign: true,
+        program: true,
+        answers: {
+          include: {
+            question: { select: { id: true, text: true, frequencyType: true, points: true } },
+            reviewedBy: { select: { name: true } },
+          },
+        },
+      },
+      orderBy: { createdAt: "desc" },
+    });
+
+    res.json(evaluations);
+  } catch (error) {
+    console.error("Error al obtener historial:", error);
+    res.status(500).json({ error: "Error al obtener historial" });
+  }
+});
+
+// ==================== EVALUACIONES - REVISAR RESPUESTA ====================
+router.put("/answer/:answerId/review", authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    if (req.user?.roleId !== 1) {
+      return res.status(403).json({ error: "Solo admins pueden calificar" });
+    }
+
+    const answerId = parseInt(req.params.answerId);
+    const { adminScore, adminComment } = req.body;
+
+    const answer = await prisma.answer.update({
+      where: { id: answerId },
+      data: {
+        adminScore: adminScore ?? null,
+        adminComment: adminComment ?? null,
+        adminReviewedAt: new Date(),
+        reviewedById: req.user.id,
+      },
+      include: {
+        question: true,
+        evaluation: { include: { answers: true } },
+      },
+    });
+
+    // Recalculate total admin score for evaluation
+    const evaluation = answer.evaluation;
+    const totalAdminScore = evaluation.answers.reduce((sum, a) => {
+      if (a.id === answerId) return sum + (adminScore || 0);
+      return sum + (a.adminScore || 0);
+    }, 0);
+
+    await prisma.evaluation.update({
+      where: { id: evaluation.id },
+      data: { totalScore: totalAdminScore },
+    });
+
+    res.json({ message: "Calificación guardada", answer, totalAdminScore });
+  } catch (error) {
+    console.error("Error al calificar:", error);
+    res.status(500).json({ error: "Error al calificar" });
+  }
+});
+
+// ==================== EVALUACIONES - USUARIOS EN PROGRAMA ====================
+router.get("/program/:programId/users", authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    if (req.user?.roleId !== 1) {
+      return res.status(403).json({ error: "Solo admins" });
+    }
+
+    const programId = parseInt(req.params.programId);
+
+    // Get users assigned to this program
+    const userPrograms = await prisma.userProgram.findMany({
+      where: { programId },
+      include: {
+        user: { include: { cargo: true } },
+      },
+    });
+
+    // Get evaluations for these users with this program
+    const userIds = userPrograms.map((up) => up.userId);
+    
+    const evaluations = await prisma.evaluation.findMany({
+      where: {
+        userId: { in: userIds },
+        programId,
+      },
+      include: {
+        user: { select: { id: true, name: true, email: true, cargo: { select: { name: true } } } },
+        answers: { select: { id: true, questionId: true, awardedScore: true, adminScore: true } },
+      },
+    });
+
+    const result = userPrograms.map((up) => {
+      const evalData = evaluations.find((e) => e.userId === up.user.id);
+      const autoScore = evalData?.answers.reduce((sum, a) => sum + (a.awardedScore || 0), 0) || 0;
+      const adminScore = evalData?.answers.reduce((sum, a) => sum + (a.adminScore || 0), 0) || 0;
+
+      return {
+        user: up.user,
+        evaluation: evalData || null,
+        autoScore,
+        adminScore,
+        hasEvaluation: !!evalData,
+      };
+    });
+
+    res.json(result);
+  } catch (error) {
+    console.error("Error al obtener usuarios del programa:", error);
+    res.status(500).json({ error: "Error al obtener usuarios" });
+  }
+});
+
 export default router;

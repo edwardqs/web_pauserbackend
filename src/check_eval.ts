@@ -1,32 +1,40 @@
 import { prisma } from "./lib/prisma.js";
 
 async function main() {
-  // Check user 3's program questions
-  const up = await prisma.userProgram.findMany({
-    where: { userId: 3 },
-    include: {
-      program: {
-        include: {
-          questions: {
-            include: {
-              question: {
-                select: { id: true, text: true, description: true, points: true, order: true },
-              },
-            },
-          },
-        },
-      },
-    },
-  });
+  try {
+    await prisma.$executeRaw`ALTER TABLE "Answer" ADD COLUMN "adminScore" INTEGER`;
+    console.log("Column 'adminScore' added");
+  } catch (e: any) {
+    console.log("adminScore:", e.message.includes("already exists") ? "already exists" : e.message);
+  }
+  
+  try {
+    await prisma.$executeRaw`ALTER TABLE "Answer" ADD COLUMN "adminComment" TEXT`;
+    console.log("Column 'adminComment' added");
+  } catch (e: any) {
+    console.log("adminComment:", e.message.includes("already exists") ? "already exists" : e.message);
+  }
+  
+  try {
+    await prisma.$executeRaw`ALTER TABLE "Answer" ADD COLUMN "adminReviewedAt" TIMESTAMP`;
+    console.log("Column 'adminReviewedAt' added");
+  } catch (e: any) {
+    console.log("adminReviewedAt:", e.message.includes("already exists") ? "already exists" : e.message);
+  }
+  
+  try {
+    await prisma.$executeRaw`ALTER TABLE "Answer" ADD COLUMN "reviewedById" INTEGER REFERENCES "User"(id)`;
+    console.log("Column 'reviewedById' added");
+  } catch (e: any) {
+    console.log("reviewedById:", e.message.includes("already exists") ? "already exists" : e.message);
+  }
 
-  console.log("User 3 program details:");
-  up.forEach(u => {
-    console.log(`Program: ${u.program.name}`);
-    console.log(`Questions: ${u.program.questions.length}`);
-    u.program.questions.forEach(q => {
-      console.log(`- ${q.question.text.substring(0,30)} (pts: ${q.question.points})`);
-    });
-  });
+  try {
+    await prisma.$executeRaw`ALTER TABLE "Evaluation" ADD COLUMN "programId" INTEGER REFERENCES "Program"(id)`;
+    console.log("Column 'programId' added to Evaluation");
+  } catch (e: any) {
+    console.log("programId (Evaluation):", e.message.includes("already exists") ? "already exists" : e.message);
+  }
 }
 
 main()
