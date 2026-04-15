@@ -1,0 +1,219 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model Role {
+  id        Int      @id @default(autoincrement())
+  name      String   @unique
+  users     User[]
+}
+
+model Sede {
+  id        Int      @id @default(autoincrement())
+  name      String
+  isActive  Boolean  @default(true)
+  users     User[]
+}
+
+model UnidadNegocio {
+  id        Int      @id @default(autoincrement())
+  name      String
+  isActive  Boolean  @default(true)
+  users     User[]
+}
+
+model Cargo {
+  id        Int      @id @default(autoincrement())
+  name      String
+  isActive  Boolean  @default(true)
+  users     User[]
+  questions QuestionCargo[]
+}
+
+model User {
+  id            Int       @id @default(autoincrement())
+  email         String    @unique
+  password      String
+  name          String?
+  roleId        Int       @default(2)
+  sedeId        Int?
+  unidadId      Int?
+  cargoId       Int?
+  role          Role      @relation(fields: [roleId], references: [id])
+  sede          Sede?     @relation(fields: [sedeId], references: [id])
+  unidadNegocio UnidadNegocio? @relation(fields: [unidadId], references: [id])
+  cargo         Cargo?    @relation(fields: [cargoId], references: [id])
+  createdAt     DateTime  @default(now())
+  evaluations   Evaluation[]
+  campaigns     CampaignUser[]
+  programs      UserProgram[]
+}
+
+model Campaign {
+  id          Int        @id @default(autoincrement())
+  name        String
+  startDate   DateTime
+  endDate     DateTime
+  isActive    Boolean    @default(true)
+  createdAt   DateTime   @default(now())
+  evaluations Evaluation[]
+  assignedUsers CampaignUser[]
+}
+
+model CampaignUser {
+  id          Int      @id @default(autoincrement())
+  campaignId  Int
+  userId      Int
+  assignedAt  DateTime @default(now())
+  campaign    Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([campaignId, userId])
+}
+
+model Question {
+  id                Int       @id @default(autoincrement())
+  text              String
+  description       String?   // Descripción de la pregunta
+  points            Int       @default(3) // Puntaje personalizable por pregunta
+  frequencyType     String    @default("UNICA") // UNICA, DIARIA, SEMANAL, MENSUAL, ANUAL, DIA_ESPECIFICO
+  frequencyDay      Int?      // Día del mes (1-31), día de la semana (1-7), o día específico según frequencyType
+  frequencyInterval Int?      // Cada cuántos períodos (ej: cada 2 semanas)
+  isActive          Boolean   @default(true)
+  order             Int       @default(0)
+  createdAt         DateTime  @default(now())
+  configs           QuestionConfig[]
+  answers           Answer[]
+  cargos            QuestionCargo[]
+  submissions       QuestionSubmission[]
+  options           QuestionOption[]
+  programs          QuestionProgram[]
+}
+
+model QuestionCargo {
+  id        Int      @id @default(autoincrement())
+  questionId Int
+  cargoId   Int
+  question  Question @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  cargo     Cargo    @relation(fields: [cargoId], references: [id])
+
+  @@unique([questionId, cargoId])
+}
+
+model QuestionOption {
+  id          Int      @id @default(autoincrement())
+  questionId  Int
+  label       String   // A, B, C, D, etc.
+  text        String   // Texto de la opción
+  score       Int      // Puntaje asignado a esta opción
+  isDefault   Boolean  @default(false) // Indica si es la opción por defecto
+  question    Question @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  answers     Answer[]
+
+  @@unique([questionId, label])
+}
+
+model QuestionConfig {
+  id          Int      @id @default(autoincrement())
+  questionId  Int
+  fileType    String   // IMAGEN, PDF, PPT, EXCEL
+  maxFiles    Int      @default(1) // cantidad máxima de archivos de este tipo
+  question    Question @relation(fields: [questionId], references: [id], onDelete: Cascade)
+
+  @@unique([questionId, fileType])
+}
+
+model Evaluation {
+  id          Int       @id @default(autoincrement())
+  userId      Int
+  campaignId  Int
+  source      String    @default("EXCELENCIA")  // EXCELENCIA, MIS_PROGRAMAS
+  totalScore  Int       @default(0)
+  maxScore    Int       @default(0) // puntaje máximo posible
+  completedAt DateTime?
+  createdAt   DateTime  @default(now())
+  user        User      @relation(fields: [userId], references: [id])
+  campaign    Campaign  @relation(fields: [campaignId], references: [id])
+  answers     Answer[]
+
+  @@unique([userId, campaignId, source])
+}
+
+model Answer {
+  id             Int        @id @default(autoincrement())
+  evaluationId   Int
+  questionId     Int
+  optionId       Int?       // Opción seleccionada por el usuario
+  awardedScore   Int        @default(0)
+  hasEvidence    Boolean    @default(false)
+  createdAt      DateTime   @default(now())
+  evaluation    Evaluation @relation(fields: [evaluationId], references: [id], onDelete: Cascade)
+  question       Question   @relation(fields: [questionId], references: [id])
+  option         QuestionOption? @relation(fields: [optionId], references: [id])
+  files          AnswerFile[]
+
+  @@unique([evaluationId, questionId])
+}
+
+model AnswerFile {
+  id          Int      @id @default(autoincrement())
+  answerId    Int
+  fileType    String   // IMAGEN, PDF, PPT, EXCEL
+  fileName    String
+  fileUrl     String
+  createdAt   DateTime @default(now())
+  answer      Answer   @relation(fields: [answerId], references: [id], onDelete: Cascade)
+}
+
+// Registra cuándo se respondió cada pregunta (para control de frecuencia)
+model QuestionSubmission {
+  id           Int      @id @default(autoincrement())
+  questionId   Int
+  userId       Int
+  campaignId   Int
+  submissionDate DateTime // Fecha en que se respondió esta instancia de la pregunta
+  periodStart  DateTime // Inicio del período (ej: lunes para semanal, 1ro del mes para mensual)
+  periodEnd    DateTime // Fin del período
+  createdAt    DateTime @default(now())
+  question     Question @relation(fields: [questionId], references: [id], onDelete: Cascade)
+
+  @@unique([questionId, userId, campaignId, periodStart])
+}
+
+// ==================== PROGRAMAS DE EXCELENCIA ====================
+model Program {
+  id          Int       @id @default(autoincrement())
+  name        String    @unique
+  description String?
+  isActive    Boolean   @default(true)
+  createdAt   DateTime  @default(now())
+  users       UserProgram[]
+  questions   QuestionProgram[]
+}
+
+model UserProgram {
+  id        Int      @id @default(autoincrement())
+  userId    Int
+  programId Int
+  assignedAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  program   Program  @relation(fields: [programId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, programId])
+}
+
+model QuestionProgram {
+  id         Int      @id @default(autoincrement())
+  questionId Int
+  programId  Int
+  assignedAt DateTime @default(now())
+  question   Question @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  program    Program  @relation(fields: [programId], references: [id], onDelete: Cascade)
+
+  @@unique([questionId, programId])
+}
