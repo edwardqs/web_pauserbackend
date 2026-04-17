@@ -2,38 +2,35 @@ import { prisma } from "./lib/prisma.js";
 
 async function main() {
   try {
-    await prisma.$executeRaw`ALTER TABLE "Answer" ADD COLUMN "adminScore" INTEGER`;
-    console.log("Column 'adminScore' added");
+    await prisma.$executeRaw`ALTER TABLE "Answer" ADD COLUMN "periodStart" TIMESTAMP`;
+    console.log("Column 'periodStart' added");
   } catch (e: any) {
-    console.log("adminScore:", e.message.includes("already exists") ? "already exists" : e.message);
+    console.log("periodStart:", e.message.includes("already exists") ? "already exists" : e.message);
   }
   
   try {
-    await prisma.$executeRaw`ALTER TABLE "Answer" ADD COLUMN "adminComment" TEXT`;
-    console.log("Column 'adminComment' added");
+    await prisma.$executeRaw`ALTER TABLE "Answer" ADD COLUMN "periodEnd" TIMESTAMP`;
+    console.log("Column 'periodEnd' added");
   } catch (e: any) {
-    console.log("adminComment:", e.message.includes("already exists") ? "already exists" : e.message);
-  }
-  
-  try {
-    await prisma.$executeRaw`ALTER TABLE "Answer" ADD COLUMN "adminReviewedAt" TIMESTAMP`;
-    console.log("Column 'adminReviewedAt' added");
-  } catch (e: any) {
-    console.log("adminReviewedAt:", e.message.includes("already exists") ? "already exists" : e.message);
-  }
-  
-  try {
-    await prisma.$executeRaw`ALTER TABLE "Answer" ADD COLUMN "reviewedById" INTEGER REFERENCES "User"(id)`;
-    console.log("Column 'reviewedById' added");
-  } catch (e: any) {
-    console.log("reviewedById:", e.message.includes("already exists") ? "already exists" : e.message);
+    console.log("periodEnd:", e.message.includes("already exists") ? "already exists" : e.message);
   }
 
   try {
-    await prisma.$executeRaw`ALTER TABLE "Evaluation" ADD COLUMN "programId" INTEGER REFERENCES "Program"(id)`;
-    console.log("Column 'programId' added to Evaluation");
+    await prisma.$executeRaw`
+      ALTER TABLE "Answer" DROP CONSTRAINT IF EXISTS "Answer_evaluationId_questionId_key"
+    `;
+    console.log("Dropped old unique constraint");
   } catch (e: any) {
-    console.log("programId (Evaluation):", e.message.includes("already exists") ? "already exists" : e.message);
+    console.log("Drop constraint:", e.message);
+  }
+
+  try {
+    await prisma.$executeRaw`
+      ALTER TABLE "Answer" ADD CONSTRAINT "Answer_evaluationId_questionId_periodStart_key" UNIQUE ("evaluationId", "questionId", "periodStart")
+    `;
+    console.log("Added new unique constraint");
+  } catch (e: any) {
+    console.log("Add constraint:", e.message);
   }
 }
 

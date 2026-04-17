@@ -9,10 +9,18 @@ router.get("/", authMiddleware, async (req: AuthRequest, res) => {
   try {
     const isAdmin = req.user?.roleId === 1;
     const cargoId = req.query.cargoId ? parseInt(req.query.cargoId as string) : null;
+    const targetType = req.query.targetType as string | undefined;
+
+    const where: any = { isActive: true };
+
+    // Filtrar por targetType (EXCELENCIA, MIS_PROGRAMAS, o AMBOS)
+    if (targetType && ["EXCELENCIA", "MIS_PROGRAMAS"].includes(targetType)) {
+      where.targetType = { in: [targetType, "AMBOS"] };
+    }
 
     if (isAdmin) {
       const questions = await prisma.question.findMany({
-        where: { isActive: true },
+        where,
         orderBy: { order: "asc" },
         include: {
           configs: true,
@@ -28,11 +36,10 @@ router.get("/", authMiddleware, async (req: AuthRequest, res) => {
       return res.status(400).json({ error: "Cargo no identificado" });
     }
 
+    where.cargos = { some: { cargoId } };
+
     const questions = await prisma.question.findMany({
-      where: {
-        isActive: true,
-        cargos: { some: { cargoId } },
-      },
+      where,
       orderBy: { order: "asc" },
       include: { 
         configs: true,
@@ -53,7 +60,7 @@ router.post("/", authMiddleware, async (req: AuthRequest, res) => {
       return res.status(403).json({ error: "Solo admins pueden crear preguntas" });
     }
 
-    const { text, description, configs, order, cargoIds, frequencyType, frequencyDay, frequencyInterval, options } = req.body;
+    const { text, description, configs, order, cargoIds, frequencyType, frequencyDay, frequencyInterval, options, targetType } = req.body;
 
     console.log("POST /api/questions - Body received:", JSON.stringify(req.body, null, 2));
 
@@ -74,6 +81,8 @@ router.post("/", authMiddleware, async (req: AuthRequest, res) => {
     const parsedFreqType = frequencyType && validFreqTypes.includes(frequencyType) ? frequencyType : "UNICA";
     const parsedFreqDay = frequencyDay !== undefined && frequencyDay !== null ? parseInt(frequencyDay, 10) : null;
     const parsedFreqInterval = frequencyInterval !== undefined && frequencyInterval !== null ? parseInt(frequencyInterval, 10) : null;
+    const validTargets = ["EXCELENCIA", "MIS_PROGRAMAS", "AMBOS"];
+    const parsedTarget = targetType && validTargets.includes(targetType) ? targetType : "AMBOS";
 
     const question = await prisma.question.create({
       data: {
@@ -83,6 +92,7 @@ router.post("/", authMiddleware, async (req: AuthRequest, res) => {
         frequencyType: parsedFreqType,
         frequencyDay: parsedFreqDay,
         frequencyInterval: parsedFreqInterval,
+        targetType: parsedTarget,
         configs: {
           create: configs.map((c: any) => ({
             fileType: c.fileType,
@@ -127,7 +137,7 @@ router.put("/:id", authMiddleware, async (req: AuthRequest, res) => {
     }
 
     const { id } = req.params;
-    const { text, description, configs, order, isActive, cargoIds, frequencyType, frequencyDay, frequencyInterval, options } = req.body;
+    const { text, description, configs, order, isActive, cargoIds, frequencyType, frequencyDay, frequencyInterval, options, targetType } = req.body;
     console.log("PUT /api/questions/:id - Body received:", JSON.stringify(req.body, null, 2));
     const questionId = parseInt(id);
 
@@ -139,6 +149,8 @@ router.put("/:id", authMiddleware, async (req: AuthRequest, res) => {
     const parsedFreqType = frequencyType && validFreqTypes.includes(frequencyType) ? frequencyType : undefined;
     const parsedFreqDay = frequencyDay !== undefined && frequencyDay !== null ? parseInt(frequencyDay, 10) : undefined;
     const parsedFreqInterval = frequencyInterval !== undefined && frequencyInterval !== null ? parseInt(frequencyInterval, 10) : undefined;
+    const validTargets = ["EXCELENCIA", "MIS_PROGRAMAS", "AMBOS"];
+    const parsedTarget = targetType && validTargets.includes(targetType) ? targetType : undefined;
 
     if (configs) {
       await prisma.questionConfig.deleteMany({ where: { questionId } });
@@ -185,6 +197,7 @@ router.put("/:id", authMiddleware, async (req: AuthRequest, res) => {
         ...(parsedFreqType !== undefined && { frequencyType: parsedFreqType }),
         ...(parsedFreqDay !== undefined && { frequencyDay: parsedFreqDay }),
         ...(parsedFreqInterval !== undefined && { frequencyInterval: parsedFreqInterval }),
+        ...(parsedTarget !== undefined && { targetType: parsedTarget }),
       },
       include: {
         configs: true,

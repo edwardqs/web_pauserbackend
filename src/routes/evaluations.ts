@@ -49,10 +49,10 @@ router.post("/upload", authMiddleware, upload.single("file"), async (req: AuthRe
 
 router.post("/submit", authMiddleware, async (req: AuthRequest, res) => {
   try {
-    const { campaignId, answers, source = "EXCELENCIA" } = req.body;
+    const { campaignId, answers, source = "EXCELENCIA", programId } = req.body;
     const userId = req.user!.id;
 
-    console.log("DEBUG submit - userId:", userId, "campaignId:", campaignId, "source:", source);
+    console.log("DEBUG submit - userId:", userId, "campaignId:", campaignId, "source:", source, "programId:", programId);
     console.log("DEBUG submit - answers:", JSON.stringify(answers).slice(0, 500));
 
     if (!userId) {
@@ -92,11 +92,21 @@ router.post("/submit", authMiddleware, async (req: AuthRequest, res) => {
       return q.cargos.some((qc) => qc.cargoId === userCargoId);
     });
 
-    // Get or create evaluation (now includes source)
-    let evaluation = await prisma.evaluation.findUnique({
-      where: { userId_campaignId_source: { userId, campaignId, source } },
-      include: { answers: { include: { files: true } } },
-    });
+    // Get or create evaluation (now includes source and programId for MIS_PROGRAMAS)
+    let evaluation;
+    if (source === "MIS_PROGRAMAS" && programId) {
+      // For MIS_PROGRAMAS, search by programId
+      evaluation = await prisma.evaluation.findFirst({
+        where: { userId, campaignId, source, programId },
+        include: { answers: { include: { files: true } } },
+      });
+    } else {
+      // For EXCELENCIA, use unique constraint (4 fields: userId, campaignId, source, programId)
+      evaluation = await prisma.evaluation.findUnique({
+        where: { userId_campaignId_source_programId: { userId, campaignId, source, programId: null } },
+        include: { answers: { include: { files: true } } },
+      });
+    }
 
     const now = new Date();
 
@@ -115,13 +125,19 @@ router.post("/submit", authMiddleware, async (req: AuthRequest, res) => {
           let awardedScore = 0;
           
           if (selectedOptionId && question) {
-            // Find the option and get its score
             const option = (question as any).options?.find((opt: any) => opt.id === selectedOptionId);
             if (option) {
               awardedScore = option.score || 0;
             }
           }
-          
+
+          // Calculate current period based on frequency
+          const { periodStart, periodEnd } = getCurrentPeriod(
+            question?.frequencyType || "UNICA",
+            question?.frequencyDay || null,
+            question?.frequencyInterval || null
+          );
+
           totalScore += awardedScore;
 
           return {
@@ -129,6 +145,8 @@ router.post("/submit", authMiddleware, async (req: AuthRequest, res) => {
             optionId: selectedOptionId,
             awardedScore,
             hasEvidence: validFiles.length > 0,
+            periodStart,
+            periodEnd,
             files: validFiles.length > 0
               ? {
                   create: validFiles.map((f: any) => ({
@@ -142,7 +160,6 @@ router.post("/submit", authMiddleware, async (req: AuthRequest, res) => {
         });
 
       const maxScore = relevantQuestions.reduce((sum, q) => {
-        // Get max score from options, fallback to 0 if no options
         const maxOptionScore = (q as any).options?.length > 0 
           ? Math.max(...(q as any).options.map((opt: any) => opt.score || 0))
           : 0;
@@ -154,20 +171,12 @@ router.post("/submit", authMiddleware, async (req: AuthRequest, res) => {
           userId,
           campaignId,
           source,
+          programId: source === "MIS_PROGRAMAS" && programId ? programId : null,
           totalScore,
           maxScore,
           completedAt: new Date(),
           answers: {
-            createMany: {
-              data: answersData
-                .filter((a: any) => a.questionId)
-                .map((a: any) => ({
-                  questionId: a.questionId,
-                  optionId: a.optionId,
-                  awardedScore: a.awardedScore,
-                  hasEvidence: a.hasEvidence,
-                }))
-            }
+            create: answersData,
           },
         },
         include: { answers: { include: { files: true } } },
@@ -177,7 +186,7 @@ router.post("/submit", authMiddleware, async (req: AuthRequest, res) => {
       for (const a of answersData) {
         if (a.files && a.files.create) {
           const answer = await prisma.answer.findFirst({
-            where: { evaluationId: evaluation.id, questionId: a.questionId },
+            where: { evaluationId: evaluation.id, questionId: a.questionId, periodStart: a.periodStart },
           });
           if (answer) {
             await prisma.answerFile.createMany({
@@ -223,69 +232,91 @@ router.post("/submit", authMiddleware, async (req: AuthRequest, res) => {
           },
           update: {
             submissionDate: now,
-            periodEnd,
           },
         });
       }
+
+      res.json(evaluation);
+      return;
     } else {
-      // Evaluation exists - check for new frequent questions
-      const existingAnswerIds = evaluation.answers.map((a) => a.questionId);
-      const newAnswers = answers.filter(
-        (a: any) => a?.questionId && !existingAnswerIds.includes(a.questionId)
-      );
+      // Evaluation exists - handle both new questions AND re-submissions for frequency
+      const now = new Date();
+      let scoreDelta = 0;
 
-      if (newAnswers.length === 0) {
-        return res.status(400).json({ error: "Ya completaste esta evaluación. No hay nuevas preguntas pendientes." });
-      }
+      // Process each answer: upsert by [evaluationId, questionId, periodStart]
+      for (const a of answers) {
+        if (!a?.questionId) continue;
 
-      // Add new answers and update score
-      let additionalScore = 0;
-      for (const a of newAnswers) {
         const hasFiles = a.files && Array.isArray(a.files) && a.files.length > 0;
         const validFiles = hasFiles ? a.files.filter((f: any) => f && f.fileUrl) : [];
         const question = relevantQuestions.find((q) => q.id === a.questionId);
-        
-        // Get selected option and calculate score
+
         const selectedOptionId = a.optionId ? parseInt(a.optionId) : null;
         let awardedScore = 0;
-        
+
         if (selectedOptionId && question) {
           const option = (question as any).options?.find((opt: any) => opt.id === selectedOptionId);
           if (option) {
             awardedScore = option.score || 0;
           }
         }
-        
-        additionalScore += awardedScore;
 
-        const answer = await prisma.answer.create({
-          data: {
+        // Calculate current period
+        const { periodStart, periodEnd } = getCurrentPeriod(
+          question?.frequencyType || "UNICA",
+          question?.frequencyDay || null,
+          question?.frequencyInterval || null,
+          now
+        );
+
+        // Check if answer exists for this question AND period
+        const existingAnswer = await prisma.answer.findFirst({
+          where: {
             evaluationId: evaluation.id,
             questionId: a.questionId,
-            optionId: selectedOptionId,
-            awardedScore,
-            hasEvidence: validFiles.length > 0,
-            files: validFiles.length > 0
-              ? {
-                  create: validFiles.map((f: any) => ({
-                    fileType: String(f.fileType || ""),
-                    fileName: String(f.fileName || ""),
-                    fileUrl: String(f.fileUrl || ""),
-                  })),
-                }
-              : undefined,
+            periodStart: periodStart,
           },
         });
 
-        // Register submission
-        if (question) {
-          const { periodStart, periodEnd } = getCurrentPeriod(
-            question.frequencyType,
-            question.frequencyDay,
-            question.frequencyInterval,
-            now
-          );
+        if (existingAnswer) {
+          // Update existing answer (re-submission in same period)
+          const oldScore = existingAnswer.awardedScore || 0;
+          await prisma.answer.update({
+            where: { id: existingAnswer.id },
+            data: {
+              optionId: selectedOptionId,
+              awardedScore,
+              hasEvidence: validFiles.length > 0,
+            },
+          });
+          scoreDelta += (awardedScore - oldScore);
+        } else {
+          // Create new answer (new question OR new period)
+          await prisma.answer.create({
+            data: {
+              evaluationId: evaluation.id,
+              questionId: a.questionId,
+              optionId: selectedOptionId,
+              awardedScore,
+              hasEvidence: validFiles.length > 0,
+              periodStart,
+              periodEnd,
+              files: validFiles.length > 0
+                ? {
+                    create: validFiles.map((f: any) => ({
+                      fileType: String(f.fileType || ""),
+                      fileName: String(f.fileName || ""),
+                      fileUrl: String(f.fileUrl || ""),
+                    })),
+                  }
+                : undefined,
+            },
+          });
+          scoreDelta += awardedScore;
+        }
 
+        // Register submission for frequency tracking
+        if (question) {
           await prisma.questionSubmission.upsert({
             where: {
               questionId_userId_campaignId_periodStart: {
@@ -311,18 +342,24 @@ router.post("/submit", authMiddleware, async (req: AuthRequest, res) => {
         }
       }
 
-      // Update evaluation score
+      // Update total score
+      const allAnswers = await prisma.answer.findMany({
+        where: { evaluationId: evaluation.id },
+      });
+      const newTotalScore = allAnswers.reduce((sum, a) => sum + (a.awardedScore || 0), 0);
+
       evaluation = await prisma.evaluation.update({
         where: { id: evaluation.id },
         data: {
-          totalScore: evaluation.totalScore + additionalScore,
-          completedAt: new Date(),
+          totalScore: newTotalScore,
+          completedAt: now,
         },
         include: { answers: { include: { files: true } } },
       });
-    }
 
-    res.json(evaluation);
+      res.json(evaluation);
+      return;
+    }
   } catch (error: any) {
     console.error("Error al enviar evaluación:", error);
     res.status(500).json({ error: error.message || "Error al enviar evaluación" });
@@ -575,7 +612,7 @@ router.get("/my-result", authMiddleware, async (req: AuthRequest, res) => {
   try {
     const userId = req.user!.id;
     const userCargoId = req.user!.cargoId;
-    const { source = "EXCELENCIA" } = req.query;
+    const { source = "EXCELENCIA", programId } = req.query;
 
     const campaign = await prisma.campaign.findFirst({
       where: { isActive: true },
@@ -585,23 +622,51 @@ router.get("/my-result", authMiddleware, async (req: AuthRequest, res) => {
       return res.json({ evaluation: null, message: "No hay campaña activa" });
     }
 
-    const evaluation = await prisma.evaluation.findUnique({
-      where: { userId_campaignId_source: { userId, campaignId: campaign.id, source: source as string } },
-      include: {
-        answers: {
-          include: {
-            question: {
-              include: {
-                configs: true,
-                options: { orderBy: { label: "asc" } },
-              }
+    // For MIS_PROGRAMAS with programId, search by program
+    let evaluation;
+    if (source === "MIS_PROGRAMAS" && programId) {
+      evaluation = await prisma.evaluation.findFirst({
+        where: { 
+          userId, 
+          campaignId: campaign.id, 
+          source: source as string,
+          programId: parseInt(programId as string),
+        },
+        include: {
+          answers: {
+            include: {
+              question: {
+                include: {
+                  configs: true,
+                  options: { orderBy: { label: "asc" } },
+                }
+              },
+              option: true,
+              files: true,
             },
-            option: true,
-            files: true,
           },
         },
-      },
-    });
+      });
+    } else {
+      // For EXCELENCIA: use 4-field unique constraint
+      evaluation = await prisma.evaluation.findUnique({
+        where: { userId_campaignId_source_programId: { userId, campaignId: campaign.id, source: source as string, programId: null } },
+        include: {
+          answers: {
+            include: {
+              question: {
+                include: {
+                  configs: true,
+                  options: { orderBy: { label: "asc" } },
+                }
+              },
+              option: true,
+              files: true,
+            },
+          },
+        },
+      });
+    }
 
     if (!evaluation) {
       return res.json({ evaluation: null, campaign });
@@ -662,6 +727,149 @@ router.get("/my-result", authMiddleware, async (req: AuthRequest, res) => {
   } catch (error) {
     console.error("Error al obtener resultado:", error);
     res.status(500).json({ error: "Error al obtener resultado" });
+  }
+});
+
+// ==================== CALIFICACIÓN FINAL ADMIN ====================
+router.put("/:id/publish-result", authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    if (req.user?.roleId !== 1) {
+      return res.status(403).json({ error: "Solo admins pueden calificar evaluaciones" });
+    }
+
+    const { id } = req.params;
+    const { adminFinalScore, adminFinalComment } = req.body;
+
+    if (adminFinalScore === undefined) {
+      return res.status(400).json({ error: "El puntaje final es requerido" });
+    }
+
+    const evaluation = await prisma.evaluation.update({
+      where: { id: parseInt(id) },
+      data: {
+        adminFinalScore: parseInt(adminFinalScore),
+        adminFinalComment: adminFinalComment || null,
+        adminPublishedAt: new Date(),
+      },
+      include: {
+        user: { select: { name: true, email: true } },
+      }
+    });
+
+    res.json(evaluation);
+  } catch (error) {
+    console.error("Error al publicar resultado final:", error);
+    res.status(500).json({ error: "Error al publicar resultado" });
+  }
+});
+
+// ==================== EVALUACIONES - HISTORIAL POR PERÍODO (USUARIO) ====================
+router.get("/my-history", authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const userId = req.user!.id;
+    const userCargoId = req.user!.cargoId;
+    const { source = "EXCELENCIA", programId } = req.query;
+
+    const campaign = await prisma.campaign.findFirst({
+      where: { isActive: true },
+    });
+
+    if (!campaign) {
+      return res.json({ evaluations: [], message: "No hay campaña activa" });
+    }
+
+// For MIS_PROGRAMAS with programId, search by program
+    let evaluation;
+    if (source === "MIS_PROGRAMAS" && programId) {
+      evaluation = await prisma.evaluation.findFirst({
+        where: { 
+          userId, 
+          campaignId: campaign.id, 
+          source: source as string,
+          programId: parseInt(programId as string),
+        },
+        include: {
+          answers: {
+            include: {
+              question: { include: { options: true } },
+              option: true,
+              files: true,
+              reviewedBy: { select: { id: true, name: true } },
+            },
+            orderBy: [{ questionId: "asc" }, { periodStart: "asc" }],
+          },
+        },
+      });
+    } else {
+      // For EXCELENCIA: use 4-field unique constraint
+      evaluation = await prisma.evaluation.findUnique({
+        where: { userId_campaignId_source_programId: { userId, campaignId: campaign.id, source: source as string, programId: null } },
+        include: {
+          answers: {
+            include: {
+              question: { include: { options: true } },
+              option: true,
+              files: true,
+              reviewedBy: { select: { id: true, name: true } },
+            },
+            orderBy: [{ questionId: "asc" }, { periodStart: "asc" }],
+          },
+        },
+      });
+    }
+
+    if (!evaluation) {
+      return res.json({ evaluations: [], campaign });
+    }
+
+    // Group answers by question
+    const questionsMap = new Map();
+    for (const answer of evaluation.answers) {
+      const qId = answer.questionId;
+      if (!questionsMap.has(qId)) {
+        questionsMap.set(qId, {
+          id: answer.question.id,
+          text: answer.question.text,
+          frequencyType: answer.question.frequencyType,
+          points: answer.question.points,
+          options: answer.question.options,
+          periods: [],
+          adminScore: null,
+          adminComment: null,
+          adminReviewedAt: null,
+          reviewedBy: null,
+        });
+      }
+      const qData = questionsMap.get(qId);
+      qData.periods.push({
+        id: answer.id,
+        periodStart: answer.periodStart,
+        periodEnd: answer.periodEnd,
+        optionId: answer.optionId,
+        optionLabel: answer.option?.label,
+        awardedScore: answer.awardedScore,
+        hasEvidence: answer.hasEvidence,
+        files: answer.files,
+      });
+      // Keep latest admin review
+      if (answer.adminScore !== null) {
+        qData.adminScore = answer.adminScore;
+        qData.adminComment = answer.adminComment;
+        qData.adminReviewedAt = answer.adminReviewedAt;
+        qData.reviewedBy = answer.reviewedBy;
+      }
+    }
+
+    // Calculate totals per question
+    const questions = Array.from(questionsMap.values()).map((q: any) => {
+      const totalAuto = q.periods.reduce((sum: number, p: any) => sum + (p.awardedScore || 0), 0);
+      return { ...q, totalAuto };
+    });
+
+    res.json({ evaluations: [{ ...evaluation, questions }], campaign });
+  } catch (error) {
+    console.error("Error al obtener historial:", error);
+    res.status(500).json({ error: "Error al obtener historial" });
   }
 });
 
@@ -791,7 +999,7 @@ router.get("/user/:userId/history", authMiddleware, async (req: AuthRequest, res
 });
 
 // ==================== EVALUACIONES - REVISAR RESPUESTA ====================
-router.put("/answer/:answerId/review", authMiddleware, async (req: AuthRequest, res) => {
+router.put("/answers/:answerId/review", authMiddleware, async (req: AuthRequest, res) => {
   try {
     if (req.user?.roleId !== 1) {
       return res.status(403).json({ error: "Solo admins pueden calificar" });
@@ -882,6 +1090,114 @@ router.get("/program/:programId/users", authMiddleware, async (req: AuthRequest,
   } catch (error) {
     console.error("Error al obtener usuarios del programa:", error);
     res.status(500).json({ error: "Error al obtener usuarios" });
+  }
+});
+
+// ==================== EVALUACIONES - DISPONIBILIDAD DE PREGUNTAS ====================
+router.get("/question-availability", authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const { programId, source = "EXCELENCIA" } = req.query;
+    const userId = req.user!.id;
+    
+    const campaign = await prisma.campaign.findFirst({ where: { isActive: true } });
+    if (!campaign) return res.json({ questions: [], message: "No hay campaña activa" });
+
+    // Obtener preguntas según source
+    let questionIds: number[] = [];
+    if (source === "MIS_PROGRAMAS" && programId) {
+      const qps = await prisma.questionProgram.findMany({
+        where: { programId: parseInt(programId as string) },
+        select: { questionId: true },
+      });
+      questionIds = qps.map(qp => qp.questionId);
+    } else {
+      const userCargoId = req.user!.cargoId;
+      const qcs = await prisma.questionCargo.findMany({
+        where: { cargoId: userCargoId || 0 },
+        include: {
+          question: {
+            where: { targetType: { in: ["EXCELENCIA", "AMBOS"] } },
+          },
+        },
+      });
+      questionIds = qcs.filter(qc => qc.question).map(qc => qc.questionId);
+    }
+
+    const questions = await prisma.question.findMany({
+      where: { id: { in: questionIds }, isActive: true },
+      include: { options: { orderBy: { label: "asc" } }, configs: true },
+    });
+
+    const submissions = await prisma.questionSubmission.findMany({
+      where: { userId, campaignId: campaign.id, questionId: { in: questionIds } },
+      orderBy: { periodStart: "desc" },
+    });
+
+    const now = new Date();
+    const availability = questions.map(q => {
+      const qSubmissions = submissions.filter(s => s.questionId === q.id);
+
+      if (q.frequencyType === "UNICA") {
+        return { 
+          ...q, 
+          available: qSubmissions.length === 0, 
+          isComplete: qSubmissions.length > 0,
+          currentPeriod: null,
+        };
+      }
+
+      const { periodStart, periodEnd } = getCurrentPeriod(
+        q.frequencyType, q.frequencyDay, q.frequencyInterval, now
+      );
+      const answeredInPeriod = qSubmissions.some(
+        s => new Date(s.periodStart).getTime() === periodStart.getTime()
+      );
+
+      return {
+        ...q,
+        available: !answeredInPeriod,
+        isComplete: answeredInPeriod,
+        currentPeriod: { periodStart: periodStart.toISOString(), periodEnd: periodEnd.toISOString() },
+      };
+    });
+
+    res.json({ questions: availability });
+  } catch (error) {
+    console.error("Error al obtener disponibilidad:", error);
+    res.status(500).json({ error: "Error al obtener disponibilidad" });
+  }
+});
+
+// ==================== ADMIN - OBTENER TODAS LAS EVALUACIONES DE UN USUARIO (DETALLE) ====================
+router.get("/user/:userId/campaign/:campaignId/details", authMiddleware, async (req, res) => {
+  try {
+    const { userId, campaignId } = req.params;
+
+    const evaluations = await prisma.evaluation.findMany({
+      where: {
+        userId: parseInt(userId),
+        campaignId: parseInt(campaignId),
+      },
+      include: {
+        user: { include: { cargo: true, sede: true, unidadNegocio: true } },
+        campaign: true,
+        program: true,
+        answers: {
+          include: {
+            question: { include: { options: true } },
+            option: true,
+            files: true,
+            reviewedBy: { select: { id: true, name: true } }
+          },
+          orderBy: [{ questionId: 'asc' }, { periodStart: 'asc' }]
+        }
+      }
+    });
+
+    res.json(evaluations);
+  } catch (error) {
+    console.error("Error fetching user combined details:", error);
+    res.status(500).json({ error: "Error al obtener detalle combinado de evaluaciones" });
   }
 });
 

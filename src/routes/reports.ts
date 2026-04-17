@@ -88,6 +88,13 @@ router.get("/monthly-comparison", authMiddleware, async (req: AuthRequest, res) 
       ORDER BY month ASC
     `;
 
+    const processedHistory = (monthlyHistory as any[]).map(row => ({
+      ...row,
+      count: typeof row.count === 'bigint' ? Number(row.count) : row.count,
+      avg_score: typeof row.avg_score === 'bigint' ? Number(row.avg_score) : Number(row.avg_score || 0),
+      max_score: typeof row.max_score === 'bigint' ? Number(row.max_score) : Number(row.max_score || 0),
+    }));
+
     // Estadísticas por cargo (admin)
     let cargoStats = null;
     if (isAdmin) {
@@ -160,7 +167,7 @@ router.get("/monthly-comparison", authMiddleware, async (req: AuthRequest, res) 
       difference: excelenciaEval && misProgramasEval
         ? excelenciaEval.totalScore - misProgramasEval.totalScore
         : null,
-      history: monthlyHistory,
+      history: processedHistory,
       cargoStats,
     });
   } catch (error: any) {

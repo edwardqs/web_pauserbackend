@@ -60,13 +60,52 @@ router.get("/my-programs", authMiddleware, async (req: AuthRequest, res: Respons
 
     console.log("my-programs found:", userPrograms.length);
 
-    const programs = userPrograms.map(up => ({
-      id: up.program.id,
-      name: up.program.name,
-      description: up.program.description,
-      assignedAt: up.assignedAt,
-      questions: up.program.questions.map(qp => qp.question),
-    }));
+    // Obtener campaña activa
+    const campaign = await prisma.campaign.findFirst({ where: { isActive: true } });
+
+    // Para cada programa, obtener resumen de evaluación
+    const programs = await Promise.all(
+      userPrograms.map(async (up) => {
+        let evaluationSummary = null;
+
+        if (campaign) {
+          const evaluation = await prisma.evaluation.findFirst({
+            where: { 
+              userId, 
+              campaignId: campaign.id, 
+              source: "MIS_PROGRAMAS", 
+              programId: up.program.id 
+            },
+            include: { answers: { select: { awardedScore: true, adminScore: true, periodStart: true } } },
+          });
+
+          if (evaluation) {
+            const totalAuto = evaluation.answers.reduce((sum, a) => sum + (a.awardedScore || 0), 0);
+            const totalAdmin = evaluation.answers.reduce((sum, a) => sum + (a.adminScore || 0), 0);
+            const hasAdminReview = evaluation.answers.some(a => a.adminScore !== null);
+            const periodsCount = new Set(evaluation.answers.map(a => a.periodStart?.toISOString()).filter(Boolean)).size;
+
+            evaluationSummary = {
+              id: evaluation.id,
+              totalScore: totalAuto,
+              totalAdminScore: hasAdminReview ? totalAdmin : null,
+              maxScore: evaluation.maxScore,
+              completedAt: evaluation.completedAt,
+              periodsAnswered: periodsCount,
+            };
+          }
+        }
+
+        return {
+          id: up.program.id,
+          name: up.program.name,
+          description: up.program.description,
+          assignedAt: up.assignedAt,
+          questions: up.program.questions.map(qp => qp.question),
+          evaluation: evaluationSummary,
+        };
+      })
+    );
 
     res.json(programs);
   } catch (error: any) {
@@ -307,7 +346,11 @@ router.get("/:id/questions", authMiddleware, async (req: AuthRequest, res: Respo
       where: { programId: parseId(req.params.id) },
       include: {
         question: {
-          include: { cargos: { include: { cargo: true } }, options: true },
+          include: {
+            cargos: { include: { cargo: true } },
+            options: { orderBy: { label: "asc" } },
+            configs: true,
+          },
         },
       },
       orderBy: { question: { order: "asc" } },
@@ -332,6 +375,83 @@ router.get("/:id/users", authMiddleware, async (req: AuthRequest, res: Response)
     res.json(userPrograms.map(up => ({ ...up.user, assignedAt: up.assignedAt })));
   } catch (error) {
     res.status(500).json({ error: "Error al obtener usuarios del programa" });
+  }
+});
+
+// ==================== CREAR PREGUNTA PARA PROGRAMA ====================
+router.post("/:id/create-question", authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    if (req.user?.roleId !== 1) {
+      return res.status(403).json({ error: "Solo admins pueden crear preguntas" });
+    }
+
+    const programId = parseId(req.params.id);
+    const { text, description, order, configs, options, frequencyType, frequencyDay, frequencyInterval } = req.body;
+
+    if (!text) {
+      return res.status(400).json({ error: "El texto de la pregunta es requerido" });
+    }
+
+    if (!options || !Array.isArray(options) || options.length === 0) {
+      return res.status(400).json({ error: "Debes agregar al menos una opción de respuesta" });
+    }
+
+    const program = await prisma.program.findUnique({ where: { id: programId } });
+    if (!program) {
+      return res.status(404).json({ error: "Programa no encontrado" });
+    }
+
+    const validFreqTypes = ["UNICA", "DIARIA", "SEMANAL", "MENSUAL", "ANUAL", "DIA_ESPECIFICO"];
+    const parsedFreqType = frequencyType && validFreqTypes.includes(frequencyType) ? frequencyType : "UNICA";
+    const parsedFreqDay = frequencyDay != null ? parseInt(frequencyDay, 10) : null;
+    const parsedFreqInterval = frequencyInterval != null ? parseInt(frequencyInterval, 10) : null;
+    const parsedOrder = order !== undefined ? parseInt(order, 10) : 0;
+
+    const question = await prisma.$transaction(async (tx) => {
+      const q = await tx.question.create({
+        data: {
+          text,
+          description: description || null,
+          order: parsedOrder,
+          targetType: "MIS_PROGRAMAS",
+          frequencyType: parsedFreqType,
+          frequencyDay: parsedFreqDay,
+          frequencyInterval: parsedFreqInterval,
+          configs: configs && configs.length > 0 ? {
+            create: configs.map((c: any) => ({
+              fileType: c.fileType,
+              maxFiles: c.maxFiles || 1,
+            })),
+          } : undefined,
+          options: {
+            create: options.map((opt: any) => ({
+              label: opt.label,
+              text: opt.text,
+              score: parseInt(opt.score, 10) || 0,
+              isDefault: opt.isDefault || false,
+            })),
+          },
+        },
+        include: {
+          configs: true,
+          options: { orderBy: { label: "asc" } },
+        },
+      });
+
+      await tx.questionProgram.create({
+        data: { questionId: q.id, programId },
+      });
+
+      return q;
+    });
+
+    res.status(201).json({
+      message: `Pregunta creada y asignada a ${program.name}`,
+      question,
+    });
+  } catch (error: any) {
+    console.error("Error al crear pregunta del programa:", error);
+    res.status(500).json({ error: error.message || "Error al crear pregunta" });
   }
 });
 

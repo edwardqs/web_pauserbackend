@@ -88,6 +88,12 @@ model Question {
   isActive          Boolean   @default(true)
   order             Int       @default(0)
   createdAt         DateTime  @default(now())
+  // targetType: EXCELENCIA = solo autoevaluación, MIS_PROGRAMAS = solo programas, AMBOS = ambos
+  targetType       String    @default("AMBOS")
+  // Para integración con Excel importado
+  type          String    @default("NORMAL")  // NORMAL | EXCEL_DATA
+  excelConfigId Int?                       // FK a ProgramFileConfig
+  hidden        Boolean  @default(false)    // true = no aparece en lista de preguntas
   configs           QuestionConfig[]
   answers           Answer[]
   cargos            QuestionCargo[]
@@ -143,8 +149,13 @@ model Evaluation {
   campaign    Campaign  @relation(fields: [campaignId], references: [id])
   program     Program?  @relation(fields: [programId], references: [id])
   answers     Answer[]
+  
+  // Resultado Final del Admin
+  adminFinalScore   Int?
+  adminFinalComment String?
+  adminPublishedAt  DateTime?
 
-  @@unique([userId, campaignId, source])
+  @@unique([userId, campaignId, source, programId])
 }
 
 model Answer {
@@ -155,6 +166,9 @@ model Answer {
   awardedScore   Int        @default(0)
   hasEvidence    Boolean    @default(false)
   createdAt      DateTime   @default(now())
+  // Campos de período (según frecuencia de pregunta)
+  periodStart    DateTime?  // Inicio del período (ej: lunes de la semana)
+  periodEnd      DateTime?  // Fin del período (ej: domingo)
   // Campos de revisión por admin
   adminScore     Int?       // Puntaje final dado por admin (por pregunta)
   adminComment   String?    // Comentario del admin
@@ -167,7 +181,7 @@ model Answer {
   files          AnswerFile[]
   reviewedBy     User?      @relation("AnswerReviewer", fields: [reviewedById], references: [id])
 
-  @@unique([evaluationId, questionId])
+  @@unique([evaluationId, questionId, periodStart])
 }
 
 model AnswerFile {
@@ -205,6 +219,7 @@ model Program {
   users       UserProgram[]
   questions   QuestionProgram[]
   evaluations Evaluation[]
+  fileConfig  ProgramFileConfig?
 }
 
 model UserProgram {
@@ -227,4 +242,33 @@ model QuestionProgram {
   program    Program  @relation(fields: [programId], references: [id], onDelete: Cascade)
 
   @@unique([questionId, programId])
+}
+
+// ==================== EXCEL CONFIG POR PROGRAMA ====================
+model ProgramFileConfig {
+  id            Int      @id @default(autoincrement())
+  programId     Int      @unique
+  fileName      String
+  frequencyType String   @default("MENSUAL")
+  executionDay  Int?
+  structureMap  Json
+  isActive      Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  program       Program  @relation(fields: [programId], references: [id], onDelete: Cascade)
+  records       MonthlyRecord[]
+}
+
+model MonthlyRecord {
+  id          Int       @id @default(autoincrement())
+  configId    Int
+  period      String
+  data        Json
+  status      String    @default("PENDIENTE")
+  source      String    @default("MANUAL")
+  completedAt DateTime?
+  createdAt   DateTime  @default(now())
+  config      ProgramFileConfig @relation(fields: [configId], references: [id], onDelete: Cascade)
+
+  @@unique([configId, period])
 }
