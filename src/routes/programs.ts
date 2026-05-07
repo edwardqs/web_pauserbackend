@@ -49,6 +49,24 @@ router.get("/my-programs", authMiddleware, async (req: AuthRequest, res: Respons
                     options: { orderBy: { label: "asc" } },
                     configs: true,
                     cargos: { include: { cargo: { select: { id: true, name: true } } } },
+                    selectors: {
+                      include: { options: { orderBy: { order: "asc" } } },
+                      orderBy: { order: "asc" },
+                    },
+                    flowConfig: {
+                      include: {
+                        approvalCargo: true,
+                        triggers: {
+                          include: {
+                            triggerOption: true,
+                            triggerSelector: {
+                              include: { options: { orderBy: { order: "asc" } } },
+                            },
+                            delegateCargo: true,
+                          },
+                        },
+                      },
+                    },
                   },
                 },
               },
@@ -350,6 +368,24 @@ router.get("/:id/questions", authMiddleware, async (req: AuthRequest, res: Respo
             cargos: { include: { cargo: true } },
             options: { orderBy: { label: "asc" } },
             configs: true,
+            selectors: {
+              include: { options: { orderBy: { order: "asc" } } },
+              orderBy: { order: "asc" },
+            },
+            flowConfig: {
+              include: {
+                approvalCargo: true,
+                triggers: {
+                  include: {
+                    triggerOption: true,
+                    triggerSelector: {
+                      include: { options: { orderBy: { order: "asc" } } },
+                    },
+                    delegateCargo: true,
+                  },
+                },
+              },
+            },
           },
         },
       },
@@ -386,13 +422,14 @@ router.post("/:id/create-question", authMiddleware, async (req: AuthRequest, res
     }
 
     const programId = parseId(req.params.id);
-    const { text, description, order, configs, options, frequencyType, frequencyDay, frequencyInterval } = req.body;
+    const { text, description, order, configs, options, frequencyType, frequencyDay, frequencyInterval, flow } = req.body;
 
     if (!text) {
       return res.status(400).json({ error: "El texto de la pregunta es requerido" });
     }
 
-    if (!options || !Array.isArray(options) || options.length === 0) {
+    let finalOptions = options;
+    if (!finalOptions || !Array.isArray(finalOptions) || finalOptions.length === 0) {
       return res.status(400).json({ error: "Debes agregar al menos una opción de respuesta" });
     }
 
@@ -424,11 +461,13 @@ router.post("/:id/create-question", authMiddleware, async (req: AuthRequest, res
             })),
           } : undefined,
           options: {
-            create: options.map((opt: any) => ({
+            create: finalOptions.map((opt: any) => ({
               label: opt.label,
               text: opt.text,
               score: parseInt(opt.score, 10) || 0,
               isDefault: opt.isDefault || false,
+              semanticKey: opt.semanticKey || null,
+              isLocked: false,
             })),
           },
         },
@@ -441,6 +480,42 @@ router.post("/:id/create-question", authMiddleware, async (req: AuthRequest, res
       await tx.questionProgram.create({
         data: { questionId: q.id, programId },
       });
+
+      if (flow && typeof flow === "object" && flow.isActive) {
+        const flowConfigData: any = {
+          questionId: q.id,
+          isActive: flow.isActive !== false,
+          requiresApproval: flow.requiresApproval || false,
+          approvalCargoId: flow.approvalCargoId ? parseInt(String(flow.approvalCargoId), 10) : null,
+          requiresDelegation: flow.requiresDelegation || false,
+          deadlineOffsetDays: flow.deadlineOffsetDays || 2,
+          deadlineBusinessDays: flow.deadlineBusinessDays || false,
+        };
+
+        const flowConfig = await tx.questionFlowConfig.create({
+          data: flowConfigData,
+        });
+
+        if (flow.requiresDelegation && Array.isArray(flow.triggers) && flow.triggers.length > 0) {
+          for (const trigger of flow.triggers) {
+            if (trigger.delegateCargoId) {
+              await tx.questionFlowTrigger.create({
+                data: {
+                  flowConfigId: flowConfig.id,
+                  delegateCargoId: parseInt(String(trigger.delegateCargoId), 10),
+                  triggerMode: trigger.triggerMode || "OPTION_SEMANTIC",
+                  triggerSemanticKey: trigger.triggerSemanticKey || null,
+                  triggerOptionId: trigger.triggerOptionId ? parseInt(String(trigger.triggerOptionId), 10) : null,
+                  triggerScore: trigger.triggerScore != null ? parseInt(String(trigger.triggerScore), 10) : null,
+                  secondFileType: trigger.secondFileType || "EXCEL",
+                  secondFileMaxFiles: trigger.secondFileMaxFiles || 1,
+                  secondFileLabel: trigger.secondFileLabel || "Plan de Acción",
+                },
+              });
+            }
+          }
+        }
+      }
 
       return q;
     });

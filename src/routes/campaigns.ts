@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { prisma } from "../lib/prisma.ts";
 import { authMiddleware, AuthRequest } from "../middleware/auth.ts";
-import { getCurrentPeriod } from "../utils/frequency.ts";
+import { getCurrentPeriod, parseId } from "../utils/frequency.ts";
 
 const router = Router();
 
@@ -188,7 +188,7 @@ router.get("/:id", authMiddleware, async (req: AuthRequest, res) => {
 
     const { id } = req.params;
     const campaign = await prisma.campaign.findUnique({
-      where: { id: parseInt(id) },
+      where: { id: parseId(id) },
       include: {
         assignedUsers: { include: { user: { select: { id: true, email: true, name: true } } } },
         evaluations: {
@@ -221,7 +221,7 @@ router.put("/:id", authMiddleware, async (req: AuthRequest, res) => {
 
     const { id } = req.params;
     const { name, startDate, endDate, assignedUserIds } = req.body;
-    const campaignId = parseInt(id);
+    const campaignId = parseId(id);
 
     if (assignedUserIds !== undefined) {
       await prisma.campaignUser.deleteMany({ where: { campaignId } });
@@ -259,7 +259,7 @@ router.post("/:id/assign", authMiddleware, async (req: AuthRequest, res) => {
 
     const { id } = req.params;
     const { userIds } = req.body;
-    const campaignId = parseInt(id);
+    const campaignId = parseId(id);
 
     const newAssignments = userIds
       .filter((userId: number) => true)
@@ -292,7 +292,7 @@ router.delete("/:id/assign/:userId", authMiddleware, async (req: AuthRequest, re
 
     const { id, userId } = req.params;
     await prisma.campaignUser.delete({
-      where: { campaignId_userId: { campaignId: parseInt(id), userId: parseInt(userId) } },
+      where: { campaignId_userId: { campaignId: parseId(id), userId: parseId(userId) } },
     });
 
     res.json({ message: "Usuario desasignado" });
@@ -310,7 +310,7 @@ router.delete("/:id", authMiddleware, async (req: AuthRequest, res) => {
     }
 
     const { id } = req.params;
-    const campaignId = parseInt(id);
+    const campaignId = parseId(id);
 
     // Delete related records first
     await prisma.evaluation.deleteMany({ where: { campaignId } });

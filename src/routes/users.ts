@@ -2,6 +2,7 @@ import { Router, Response } from "express";
 import bcrypt from "bcryptjs";
 import { prisma } from "../lib/prisma.ts";
 import { authMiddleware, AuthRequest } from "../middleware/auth.ts";
+import { parseId, queryNum } from "../utils/frequency.ts";
 
 const router = Router();
 
@@ -71,7 +72,7 @@ router.put("/:id", authMiddleware, async (req: AuthRequest, res: Response) => {
 
     const { id } = req.params;
     const { email, password, name, roleId, sedeId, unidadId, cargoId } = req.body;
-    const userId = parseInt(id);
+    const userId = parseId(id);
 
     const existingUser = await prisma.user.findUnique({ where: { id: userId } });
     if (!existingUser) {
@@ -133,7 +134,7 @@ router.delete("/:id", authMiddleware, async (req: AuthRequest, res: Response) =>
     }
 
     const { id } = req.params;
-    const userId = parseInt(id);
+    const userId = parseId(id);
 
     const existingUser = await prisma.user.findUnique({ where: { id: userId } });
     if (!existingUser) {
@@ -170,7 +171,7 @@ router.put("/:id/role", authMiddleware, async (req: AuthRequest, res: Response) 
 
     const { id } = req.params;
     const { roleId, sedeId, unidadId, cargoId } = req.body;
-    const userId = parseInt(id);
+    const userId = parseId(id);
 
     const user = await prisma.user.update({
       where: { id: userId },
@@ -199,9 +200,9 @@ router.get("/", authMiddleware, async (req: AuthRequest, res: Response) => {
     const { sedeId, unidadId, cargoId } = req.query;
 
     const where: any = {};
-    if (sedeId) where.sedeId = parseInt(sedeId as string);
-    if (unidadId) where.unidadId = parseInt(unidadId as string);
-    if (cargoId) where.cargoId = parseInt(cargoId as string);
+    if (sedeId) where.sedeId = queryNum(sedeId);
+    if (unidadId) where.unidadId = queryNum(unidadId);
+    if (cargoId) where.cargoId = queryNum(cargoId);
 
     const users = await prisma.user.findMany({
       where,
@@ -258,7 +259,7 @@ router.put("/profile", authMiddleware, async (req: AuthRequest, res: Response) =
 router.get("/:id", authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
     const { id } = req.params;
-    const userId = parseInt(id);
+    const userId = parseId(id);
 
     const user = await prisma.user.findUnique({
       where: { id: userId },
@@ -293,7 +294,7 @@ router.get("/:id/programs", authMiddleware, async (req: AuthRequest, res: Respon
       return res.status(403).json({ error: "Solo admins pueden ver programas de usuario" });
     }
 
-    const userId = parseInt(req.params.id);
+    const userId = parseId(req.params.id);
 
     const userPrograms = await prisma.userProgram.findMany({
       where: { userId },
@@ -346,7 +347,7 @@ router.post("/:id/programs", authMiddleware, async (req: AuthRequest, res: Respo
       return res.status(403).json({ error: "Solo admins pueden gestionar programas de usuario" });
     }
 
-    const userId = parseInt(req.params.id);
+    const userId = parseId(req.params.id);
     const { programIds }: { programIds: number[] } = req.body;
 
     if (!Array.isArray(programIds)) {

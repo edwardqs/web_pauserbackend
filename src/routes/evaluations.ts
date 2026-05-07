@@ -4,7 +4,9 @@ import { authMiddleware, AuthRequest } from "../middleware/auth.ts";
 import multer from "multer";
 import path from "path";
 import fs from "fs";
-import { getCurrentPeriod, isQuestionAvailableToday } from "../utils/frequency.ts";
+import { getCurrentPeriod, isQuestionAvailableToday, parseId } from "../utils/frequency.ts";
+import { calcDeadline } from "../utils/deadline.ts";
+import { matchesTrigger } from "../utils/flowHelpers.ts";
 
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
@@ -84,6 +86,7 @@ router.post("/submit", authMiddleware, async (req: AuthRequest, res) => {
       include: {
         cargos: true,
         options: true,
+        selectors: { include: { options: true } },
       },
     });
 
@@ -143,6 +146,8 @@ router.post("/submit", authMiddleware, async (req: AuthRequest, res) => {
           return {
             questionId: a.questionId,
             optionId: selectedOptionId,
+            optionIds: Array.isArray(a.optionIds) ? a.optionIds.map(Number).filter((n: number) => !isNaN(n)) : [],
+            detailText: a.detailText || null,
             awardedScore,
             hasEvidence: validFiles.length > 0,
             periodStart,
@@ -183,7 +188,8 @@ router.post("/submit", authMiddleware, async (req: AuthRequest, res) => {
       });
 
       // Create files separately for each answer
-      for (const a of answersData) {
+      for (let i = 0; i < answersData.length; i++) {
+        const a = answersData[i];
         if (a.files && a.files.create) {
           const answer = await prisma.answer.findFirst({
             where: { evaluationId: evaluation.id, questionId: a.questionId, periodStart: a.periodStart },
@@ -197,6 +203,34 @@ router.post("/submit", authMiddleware, async (req: AuthRequest, res) => {
                 fileUrl: f.fileUrl,
               })),
             });
+          }
+        }
+
+        // Create selector responses
+        const originalAnswer = answers.find((oa: any) => oa.questionId === a.questionId);
+        if (originalAnswer?.selectorResponses && typeof originalAnswer.selectorResponses === 'object') {
+          const answer = await prisma.answer.findFirst({
+            where: { evaluationId: evaluation.id, questionId: a.questionId, periodStart: a.periodStart },
+          });
+          if (answer) {
+            for (const [selectorIdStr, optionIds] of Object.entries(originalAnswer.selectorResponses)) {
+              const selectorId = parseInt(selectorIdStr);
+              if (!isNaN(selectorId) && Array.isArray(optionIds)) {
+                await prisma.evaluationAnswerSelector.upsert({
+                  where: {
+                    answerId_selectorId: { answerId: answer.id, selectorId }
+                  },
+                  create: {
+                    answerId: answer.id,
+                    selectorId,
+                    selectedOptionIds: optionIds.map(Number).filter((n: number) => !isNaN(n)),
+                  },
+                  update: {
+                    selectedOptionIds: optionIds.map(Number).filter((n: number) => !isNaN(n)),
+                  },
+                });
+              }
+            }
           }
         }
       }
@@ -236,6 +270,84 @@ router.post("/submit", authMiddleware, async (req: AuthRequest, res) => {
         });
       }
 
+      // ================= DELEGATION LOGIC =================
+      const allAnswersUpdated1 = await prisma.answer.findMany({
+        where: { evaluationId: evaluation.id },
+        include: { question: { include: { options: true, selectors: { include: { options: true } } } }, selectorResponses: true }
+      });
+
+for (const ans of allAnswersUpdated1) {
+        if (!ans.periodStart) continue;
+
+        const flowConfig = await prisma.questionFlowConfig.findUnique({
+          where: { questionId: ans.questionId },
+          include: { triggers: { orderBy: { id: 'asc' } } }
+        });
+
+        if (flowConfig && flowConfig.isActive && flowConfig.requiresDelegation && flowConfig.triggers.length > 0) {
+          const selectedScore = ans.awardedScore || 0;
+          let firedTrigger = null;
+
+          const ansOption = (ans.question as any).options?.find((o: any) => o.id === ans.optionId);
+          const selectorResponsesMap: { [selectorId: number]: number[] } = {};
+          const selectorSemanticKeysMap: { [selectorId: number]: string[] } = {};
+
+          const questionSelectors = (ans.question as any).selectors ?? [];
+          const optionSemanticById = new Map<number, string>();
+          for (const sel of questionSelectors) {
+            for (const opt of sel.options ?? []) {
+              if (opt.semanticKey) optionSemanticById.set(opt.id, opt.semanticKey);
+            }
+          }
+
+          if ((ans as any).selectorResponses) {
+            for (const sr of (ans as any).selectorResponses) {
+              selectorResponsesMap[sr.selectorId] = sr.selectedOptionIds || [];
+              selectorSemanticKeysMap[sr.selectorId] = (sr.selectedOptionIds || [])
+                .map((id: number) => optionSemanticById.get(id))
+                .filter((k: string | undefined): k is string => !!k);
+            }
+          }
+          const answerForTrigger = {
+            optionId: ans.optionId,
+            optionIds: (ans as any).optionIds || [],
+            awardedScore: selectedScore,
+            optionSemanticKey: ansOption?.semanticKey || null,
+            selectorResponses: selectorResponsesMap,
+            selectorSemanticKeys: selectorSemanticKeysMap,
+          };
+
+          for (const trigger of flowConfig.triggers) {
+            if (matchesTrigger(trigger as any, answerForTrigger)) {
+              firedTrigger = trigger;
+              break;
+            }
+          }
+
+          if (firedTrigger) {
+            const deadlineAt = calcDeadline(ans.periodStart, flowConfig.deadlineOffsetDays, flowConfig.deadlineBusinessDays);
+            
+            await prisma.answerDelegation.upsert({
+              where: { answerId: ans.id },
+              create: {
+                answerId: ans.id,
+                triggerId: firedTrigger.id,
+                deadlineAt,
+                status: "PENDIENTE"
+              },
+              update: {
+                triggerId: firedTrigger.id,
+                deadlineAt,
+                status: "PENDIENTE",
+                completedAt: null,
+                completedByUserId: null
+              }
+            });
+          }
+        }
+      }
+      // ===================================================
+
       res.json(evaluation);
       return;
     } else {
@@ -269,6 +381,9 @@ router.post("/submit", authMiddleware, async (req: AuthRequest, res) => {
           now
         );
 
+        const parsedOptionIds = Array.isArray(a.optionIds) ? a.optionIds.map(Number).filter((n: number) => !isNaN(n)) : [];
+        const parsedDetailText = a.detailText || null;
+
         // Check if answer exists for this question AND period
         const existingAnswer = await prisma.answer.findFirst({
           where: {
@@ -285,18 +400,21 @@ router.post("/submit", authMiddleware, async (req: AuthRequest, res) => {
             where: { id: existingAnswer.id },
             data: {
               optionId: selectedOptionId,
+              optionIds: parsedOptionIds,
+              detailText: parsedDetailText,
               awardedScore,
               hasEvidence: validFiles.length > 0,
             },
           });
           scoreDelta += (awardedScore - oldScore);
         } else {
-          // Create new answer (new question OR new period)
           await prisma.answer.create({
             data: {
               evaluationId: evaluation.id,
               questionId: a.questionId,
               optionId: selectedOptionId,
+              optionIds: parsedOptionIds,
+              detailText: parsedDetailText,
               awardedScore,
               hasEvidence: validFiles.length > 0,
               periodStart,
@@ -356,6 +474,84 @@ router.post("/submit", authMiddleware, async (req: AuthRequest, res) => {
         },
         include: { answers: { include: { files: true } } },
       });
+
+      // ================= DELEGATION LOGIC =================
+      const allAnswersUpdated2 = await prisma.answer.findMany({
+        where: { evaluationId: evaluation.id },
+        include: { question: { include: { options: true, selectors: { include: { options: true } } } }, selectorResponses: true }
+      });
+
+      for (const ans of allAnswersUpdated2) {
+        if (!ans.periodStart) continue;
+
+        const flowConfig = await prisma.questionFlowConfig.findUnique({
+          where: { questionId: ans.questionId },
+          include: { triggers: { orderBy: { id: 'asc' } } }
+        });
+
+        if (flowConfig && flowConfig.isActive && flowConfig.requiresDelegation && flowConfig.triggers.length > 0) {
+          const selectedScore = ans.awardedScore || 0;
+          let firedTrigger = null;
+
+          const ansOption = (ans.question as any).options?.find((o: any) => o.id === ans.optionId);
+          const selectorResponsesMap: { [selectorId: number]: number[] } = {};
+          const selectorSemanticKeysMap: { [selectorId: number]: string[] } = {};
+
+          const questionSelectors = (ans.question as any).selectors ?? [];
+          const optionSemanticById = new Map<number, string>();
+          for (const sel of questionSelectors) {
+            for (const opt of sel.options ?? []) {
+              if (opt.semanticKey) optionSemanticById.set(opt.id, opt.semanticKey);
+            }
+          }
+
+          if ((ans as any).selectorResponses) {
+            for (const sr of (ans as any).selectorResponses) {
+              selectorResponsesMap[sr.selectorId] = sr.selectedOptionIds || [];
+              selectorSemanticKeysMap[sr.selectorId] = (sr.selectedOptionIds || [])
+                .map((id: number) => optionSemanticById.get(id))
+                .filter((k: string | undefined): k is string => !!k);
+            }
+          }
+          const answerForTrigger = {
+            optionId: ans.optionId,
+            optionIds: (ans as any).optionIds || [],
+            awardedScore: selectedScore,
+            optionSemanticKey: ansOption?.semanticKey || null,
+            selectorResponses: selectorResponsesMap,
+            selectorSemanticKeys: selectorSemanticKeysMap,
+          };
+
+          for (const trigger of flowConfig.triggers) {
+            if (matchesTrigger(trigger as any, answerForTrigger)) {
+              firedTrigger = trigger;
+              break;
+            }
+          }
+
+          if (firedTrigger) {
+            const deadlineAt = calcDeadline(ans.periodStart, flowConfig.deadlineOffsetDays, flowConfig.deadlineBusinessDays);
+            
+            await prisma.answerDelegation.upsert({
+              where: { answerId: ans.id },
+              create: {
+                answerId: ans.id,
+                triggerId: firedTrigger.id,
+                deadlineAt,
+                status: "PENDIENTE"
+              },
+              update: {
+                triggerId: firedTrigger.id,
+                deadlineAt,
+                status: "PENDIENTE",
+                completedAt: null,
+                completedByUserId: null
+              }
+            });
+          }
+        }
+      }
+      // ===================================================
 
       res.json(evaluation);
       return;
@@ -639,10 +835,12 @@ router.get("/my-result", authMiddleware, async (req: AuthRequest, res) => {
                 include: {
                   configs: true,
                   options: { orderBy: { label: "asc" } },
+                  selectors: { include: { options: { orderBy: { order: "asc" } } }, orderBy: { order: "asc" } },
                 }
               },
               option: true,
               files: true,
+              selectorResponses: true,
             },
           },
         },
@@ -658,10 +856,12 @@ router.get("/my-result", authMiddleware, async (req: AuthRequest, res) => {
                 include: {
                   configs: true,
                   options: { orderBy: { label: "asc" } },
+                  selectors: { include: { options: { orderBy: { order: "asc" } } }, orderBy: { order: "asc" } },
                 }
               },
               option: true,
               files: true,
+              selectorResponses: true,
             },
           },
         },
@@ -678,6 +878,7 @@ router.get("/my-result", authMiddleware, async (req: AuthRequest, res) => {
       include: { 
         cargos: true,
         options: true,
+        selectors: true,
       },
     });
 
@@ -745,7 +946,7 @@ router.put("/:id/publish-result", authMiddleware, async (req: AuthRequest, res) 
     }
 
     const evaluation = await prisma.evaluation.update({
-      where: { id: parseInt(id) },
+      where: { id: parseId(id) },
       data: {
         adminFinalScore: parseInt(adminFinalScore),
         adminFinalComment: adminFinalComment || null,
@@ -928,7 +1129,7 @@ router.get("/:id/details", authMiddleware, async (req: AuthRequest, res) => {
       return res.status(403).json({ error: "Solo admins pueden ver detalles" });
     }
 
-    const evaluationId = parseInt(req.params.id);
+    const evaluationId = parseId(req.params.id);
 
     const evaluation = await prisma.evaluation.findUnique({
       where: { id: evaluationId },
@@ -970,11 +1171,11 @@ router.get("/:id/details", authMiddleware, async (req: AuthRequest, res) => {
 // ==================== EVALUACIONES - HISTORIAL POR USUARIO ====================
 router.get("/user/:userId/history", authMiddleware, async (req: AuthRequest, res) => {
   try {
-    if (req.user?.roleId !== 1 && req.user?.id !== parseInt(req.params.userId)) {
+    if (req.user?.roleId !== 1 && req.user?.id !== parseId(req.params.userId)) {
       return res.status(403).json({ error: "Sin permisos" });
     }
 
-    const userId = parseInt(req.params.userId);
+    const userId = parseId(req.params.userId);
 
     const evaluations = await prisma.evaluation.findMany({
       where: { userId },
@@ -1005,7 +1206,7 @@ router.put("/answers/:answerId/review", authMiddleware, async (req: AuthRequest,
       return res.status(403).json({ error: "Solo admins pueden calificar" });
     }
 
-    const answerId = parseInt(req.params.answerId);
+    const answerId = parseId(req.params.answerId);
     const { adminScore, adminComment } = req.body;
 
     const answer = await prisma.answer.update({
@@ -1048,7 +1249,7 @@ router.get("/program/:programId/users", authMiddleware, async (req: AuthRequest,
       return res.status(403).json({ error: "Solo admins" });
     }
 
-    const programId = parseInt(req.params.programId);
+    const programId = parseId(req.params.programId);
 
     // Get users assigned to this program
     const userPrograms = await prisma.userProgram.findMany({
@@ -1112,20 +1313,20 @@ router.get("/question-availability", authMiddleware, async (req: AuthRequest, re
       questionIds = qps.map(qp => qp.questionId);
     } else {
       const userCargoId = req.user!.cargoId;
-      const qcs = await prisma.questionCargo.findMany({
-        where: { cargoId: userCargoId || 0 },
-        include: {
-          question: {
-            where: { targetType: { in: ["EXCELENCIA", "AMBOS"] } },
-          },
+      const questions = await prisma.question.findMany({
+        where: {
+          cargos: { some: { cargoId: userCargoId || 0 } },
+          targetType: { in: ["EXCELENCIA", "AMBOS"] },
+          isActive: true,
         },
+        select: { id: true },
       });
-      questionIds = qcs.filter(qc => qc.question).map(qc => qc.questionId);
+      questionIds = questions.map(q => q.id);
     }
 
     const questions = await prisma.question.findMany({
       where: { id: { in: questionIds }, isActive: true },
-      include: { options: { orderBy: { label: "asc" } }, configs: true },
+      include: { options: { orderBy: { label: "asc" } }, configs: true, selectors: { include: { options: { orderBy: { order: "asc" } } }, orderBy: { order: "asc" } } },
     });
 
     const submissions = await prisma.questionSubmission.findMany({
@@ -1175,8 +1376,8 @@ router.get("/user/:userId/campaign/:campaignId/details", authMiddleware, async (
 
     const evaluations = await prisma.evaluation.findMany({
       where: {
-        userId: parseInt(userId),
-        campaignId: parseInt(campaignId),
+        userId: parseId(userId),
+        campaignId: parseId(campaignId),
       },
       include: {
         user: { include: { cargo: true, sede: true, unidadNegocio: true } },
@@ -1198,6 +1399,370 @@ router.get("/user/:userId/campaign/:campaignId/details", authMiddleware, async (
   } catch (error) {
     console.error("Error fetching user combined details:", error);
     res.status(500).json({ error: "Error al obtener detalle combinado de evaluaciones" });
+  }
+});
+
+// ==================== HELPER: Recompute Evaluation Progress ====================
+type ProgressResult = {
+  answered: number;
+  expected: number;
+  percentage: number;
+  isComplete: boolean;
+};
+
+async function recomputeEvaluationProgress(evaluationId: number): Promise<ProgressResult> {
+  const evaluation = await prisma.evaluation.findUnique({
+    where: { id: evaluationId },
+    include: {
+      user: { select: { cargoId: true } },
+      program: { select: { id: true } },
+      campaign: { select: { id: true } },
+      answers: {
+        where: { status: { in: ["ANSWERED", "COMPLETED"] } },
+        include: { question: { include: { configs: true, cargos: true } } }
+      }
+    }
+  });
+
+  if (!evaluation) throw new Error("Evaluation not found");
+
+  const userCargoId = evaluation.user.cargoId;
+  const programId = evaluation.program?.id;
+  const campaignId = evaluation.campaign.id;
+  const now = new Date();
+
+  let relevantQuestions: any[] = [];
+  if (programId) {
+    const qps = await prisma.questionProgram.findMany({
+      where: { programId },
+      select: { questionId: true }
+    });
+    const questionIds = qps.map(qp => qp.questionId);
+    relevantQuestions = await prisma.question.findMany({
+      where: { id: { in: questionIds }, isActive: true },
+      include: { configs: true, cargos: true }
+    });
+  } else {
+    relevantQuestions = await prisma.question.findMany({
+      where: {
+        cargos: { some: { cargoId: userCargoId || 0 } },
+        targetType: { in: ["EXCELENCIA", "AMBOS"] },
+        isActive: true
+      },
+      include: { configs: true, cargos: true }
+    });
+  }
+
+  let expected = 0;
+  let answered = 0;
+
+  for (const q of relevantQuestions) {
+    const { periodStart, periodEnd } = getCurrentPeriod(
+      q.frequencyType,
+      q.frequencyDay,
+      q.frequencyInterval,
+      now
+    );
+
+    if (periodStart > now) continue;
+
+    expected += 1;
+
+    const answer = evaluation.answers.find(
+      a => a.questionId === q.id && a.periodStart?.getTime() === periodStart.getTime()
+    );
+
+    if (answer && answer.status === "ANSWERED" || answer?.status === "COMPLETED") {
+      answered += 1;
+    }
+  }
+
+  const percentage = expected > 0 ? Math.round((answered / expected) * 100) : 0;
+  const hasPending = evaluation.answers.some(a =>
+    a.status === "PENDING_DELEGATION" || a.status === "PENDING_APPROVAL"
+  );
+  const isComplete = answered === expected && !hasPending;
+
+  if (isComplete) {
+    await prisma.evaluation.update({
+      where: { id: evaluationId },
+      data: { completedAt: now }
+    });
+  } else {
+    await prisma.evaluation.update({
+      where: { id: evaluationId },
+      data: { completedAt: null }
+    });
+  }
+
+  return { answered, expected, percentage, isComplete };
+}
+
+// ==================== POST /evaluations/answer (per-question save) ====================
+router.post("/answer", authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const { campaignId, programId, source = "MIS_PROGRAMAS", questionId, optionId, optionIds, files, selectorResponses, detailText } = req.body;
+    const userId = req.user!.id;
+
+    if (!campaignId || !questionId) {
+      return res.status(400).json({ error: "Falta campaignId o questionId" });
+    }
+
+    if (!["EXCELENCIA", "MIS_PROGRAMAS"].includes(source)) {
+      return res.status(400).json({ error: "Source inválido" });
+    }
+
+    const question = await prisma.question.findUnique({
+      where: { id: questionId },
+      include: {
+        options: true,
+        selectors: { include: { options: true } },
+        configs: true,
+        cargos: true,
+        flowConfig: { include: { triggers: { orderBy: { id: "asc" } } } }
+      }
+    });
+
+    if (!question) {
+      return res.status(404).json({ error: "Pregunta no encontrada" });
+    }
+
+    const { periodStart, periodEnd } = getCurrentPeriod(
+      question.frequencyType,
+      question.frequencyDay,
+      question.frequencyInterval
+    );
+
+    let evaluation;
+    if (source === "MIS_PROGRAMAS" && programId) {
+      evaluation = await prisma.evaluation.findFirst({
+        where: { userId, campaignId, source, programId }
+      });
+      if (!evaluation) {
+        evaluation = await prisma.evaluation.create({
+          data: { userId, campaignId, source, programId }
+        });
+      }
+    } else {
+      evaluation = await prisma.evaluation.findFirst({
+        where: { userId, campaignId, source, programId: null }
+      });
+      if (!evaluation) {
+        evaluation = await prisma.evaluation.create({
+          data: { userId, campaignId, source, programId: null }
+        });
+      }
+    }
+
+    const selectedOptionId = optionId ? parseInt(optionId) : null;
+    let awardedScore = 0;
+    if (selectedOptionId) {
+      const option = question.options.find(o => o.id === selectedOptionId);
+      if (option) awardedScore = option.score || 0;
+    }
+
+    const parsedOptionIds = Array.isArray(optionIds)
+      ? optionIds.map(Number).filter(n => !isNaN(n))
+      : [];
+    const parsedDetailText = detailText || null;
+
+    const hasFiles = files && Array.isArray(files) && files.length > 0;
+    const validFiles = hasFiles ? files.filter((f: any) => f && f.fileUrl) : [];
+
+    const existingAnswer = await prisma.answer.findFirst({
+      where: { evaluationId: evaluation.id, questionId, periodStart }
+    });
+
+    let answer;
+    if (existingAnswer) {
+      answer = await prisma.answer.update({
+        where: { id: existingAnswer.id },
+        data: {
+          optionId: selectedOptionId,
+          optionIds: parsedOptionIds,
+          detailText: parsedDetailText,
+          awardedScore,
+          hasEvidence: validFiles.length > 0,
+          status: "ANSWERED"
+        }
+      });
+
+      if (validFiles.length > 0) {
+        await prisma.answerFile.createMany({
+          data: validFiles.map((f: any) => ({
+            answerId: answer.id,
+            fileType: String(f.fileType || ""),
+            fileName: String(f.fileName || ""),
+            fileUrl: String(f.fileUrl || "")
+          }))
+        });
+      }
+    } else {
+      answer = await prisma.answer.create({
+        data: {
+          evaluationId: evaluation.id,
+          questionId,
+          optionId: selectedOptionId,
+          optionIds: parsedOptionIds,
+          detailText: parsedDetailText,
+          awardedScore,
+          hasEvidence: validFiles.length > 0,
+          periodStart,
+          periodEnd,
+          status: "ANSWERED",
+          files: validFiles.length > 0 ? {
+            create: validFiles.map((f: any) => ({
+              fileType: String(f.fileType || ""),
+              fileName: String(f.fileName || ""),
+              fileUrl: String(f.fileUrl || "")
+            }))
+          } : undefined
+        }
+      });
+    }
+
+    if (selectorResponses && typeof selectorResponses === "object") {
+      for (const [selectorIdStr, optionIdsArr] of Object.entries(selectorResponses)) {
+        const selectorId = parseInt(selectorIdStr);
+        if (!isNaN(selectorId) && Array.isArray(optionIdsArr)) {
+          await prisma.evaluationAnswerSelector.upsert({
+            where: { answerId_selectorId: { answerId: answer.id, selectorId } },
+            create: {
+              answerId: answer.id,
+              selectorId,
+              selectedOptionIds: (optionIdsArr as number[]).map(Number).filter(n => !isNaN(n))
+            },
+            update: {
+              selectedOptionIds: (optionIdsArr as number[]).map(Number).filter(n => !isNaN(n))
+            }
+          });
+        }
+      }
+    }
+
+    await prisma.questionSubmission.upsert({
+      where: {
+        questionId_userId_campaignId_periodStart: { questionId, userId, campaignId, periodStart }
+      },
+      create: { questionId, userId, campaignId, submissionDate: new Date(), periodStart, periodEnd },
+      update: { submissionDate: new Date(), periodEnd }
+    });
+
+    let delegation: any = null;
+    let firedTrigger: any = null;
+
+    if (question.flowConfig && question.flowConfig.isActive && question.flowConfig.requiresDelegation) {
+      const questionSelectors = question.selectors || [];
+      const optionSemanticById = new Map<number, string>();
+      for (const sel of questionSelectors) {
+        for (const opt of sel.options || []) {
+          if (opt.semanticKey) optionSemanticById.set(opt.id, opt.semanticKey);
+        }
+      }
+
+      const selectorResponsesMap: { [selectorId: number]: number[] } = {};
+      const selectorSemanticKeysMap: { [selectorId: number]: string[] } = {};
+
+      if (selectorResponses && typeof selectorResponses === "object") {
+        for (const [selectorIdStr, optIds] of Object.entries(selectorResponses)) {
+          const selectorId = parseInt(selectorIdStr);
+          if (!isNaN(selectorId) && Array.isArray(optIds)) {
+            selectorResponsesMap[selectorId] = optIds;
+            selectorSemanticKeysMap[selectorId] = (optIds as number[])
+              .map(id => optionSemanticById.get(id))
+              .filter((k): k is string => !!k);
+          }
+        }
+      }
+
+      const ansOption = question.options.find(o => o.id === selectedOptionId);
+      const answerForTrigger = {
+        optionId: selectedOptionId,
+        optionIds: parsedOptionIds,
+        awardedScore,
+        optionSemanticKey: ansOption?.semanticKey || null,
+        selectorResponses: selectorResponsesMap,
+        selectorSemanticKeys: selectorSemanticKeysMap
+      };
+
+      for (const trigger of question.flowConfig.triggers) {
+        if (matchesTrigger(trigger as any, answerForTrigger)) {
+          firedTrigger = trigger;
+          break;
+        }
+      }
+
+      if (firedTrigger) {
+        const existingDelegation = await prisma.answerDelegation.findUnique({
+          where: { answerId: answer.id }
+        });
+
+        if (!existingDelegation || existingDelegation.status === "CANCELADA") {
+          const deadlineAt = calcDeadline(periodStart, question.flowConfig.deadlineOffsetDays, question.flowConfig.deadlineBusinessDays);
+
+          delegation = await prisma.answerDelegation.upsert({
+            where: { answerId: answer.id },
+            create: {
+              answerId: answer.id,
+              triggerId: firedTrigger.id,
+              deadlineAt,
+              status: "PENDIENTE"
+            },
+            update: {
+              triggerId: firedTrigger.id,
+              deadlineAt,
+              status: "PENDIENTE",
+              completedAt: null,
+              completedByUserId: null
+            }
+          });
+
+          await prisma.answer.update({
+            where: { id: answer.id },
+            data: { status: "PENDING_DELEGATION" }
+          });
+        }
+      }
+    }
+
+    let approval: any = null;
+    if (question.flowConfig && question.flowConfig.isActive && question.flowConfig.requiresApproval && !delegation) {
+      const existingApproval = await prisma.answerApproval.findUnique({
+        where: { answerId: answer.id }
+      });
+
+      if (!existingApproval) {
+        approval = await prisma.answerApproval.create({
+          data: {
+            answerId: answer.id,
+            approverCargoId: question.flowConfig.approvalCargoId!,
+            status: "PENDIENTE"
+          }
+        });
+
+        await prisma.answer.update({
+          where: { id: answer.id },
+          data: { status: "PENDING_APPROVAL" }
+        });
+      }
+    }
+
+    const progress = await recomputeEvaluationProgress(evaluation.id);
+
+    res.json({
+      answer,
+      delegation,
+      approval,
+      progress: {
+        answered: progress.answered,
+        expected: progress.expected,
+        percentage: progress.percentage,
+        isComplete: progress.isComplete
+      }
+    });
+  } catch (error: any) {
+    console.error("Error en POST /evaluations/answer:", error);
+    res.status(500).json({ error: error.message || "Error al guardar respuesta" });
   }
 });
 

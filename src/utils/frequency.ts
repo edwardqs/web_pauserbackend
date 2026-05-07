@@ -1,3 +1,43 @@
+import { Request } from "express";
+
+/**
+ * Convierte req.params.id de Express 5.x (string | string[]) a string
+ */
+export function paramString(val: string | string[] | undefined | null): string {
+  if (!val) return "";
+  if (Array.isArray(val)) return String(val[0]);
+  return val;
+}
+
+/**
+ * Convierte req.params.id a número
+ */
+export function paramNumber(val: string | string[] | undefined | null): number | null {
+  const str = paramString(val);
+  if (!str) return null;
+  const num = parseInt(str, 10);
+  return isNaN(num) ? null : num;
+}
+
+/**
+ * Alias para paramNumber (nombre más claro para IDs)
+ */
+export const parseId = paramNumber;
+
+/**
+ * Convierte query param de Express 5.x a número
+ */
+export function queryNum(val: unknown): number | null {
+  if (!val) return null;
+  if (Array.isArray(val)) return paramNumber(val[0]);
+  if (typeof val === "object") {
+    const first = Object.values(val)[0];
+    if (Array.isArray(first)) return paramNumber(first[0]);
+    return paramNumber(first as string | string[] | undefined);
+  }
+  return paramNumber(val as string | string[] | undefined);
+}
+
 /**
  * Calcula el período actual basado en la frecuencia de la pregunta
  * Retorna { periodStart, periodEnd } para saber en qué período estamos

@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { prisma } from "../lib/prisma.ts";
 import { authMiddleware, AuthRequest } from "../middleware/auth.ts";
+import { parseId } from "../utils/frequency.ts";
 
 const router = Router();
 
@@ -26,6 +27,22 @@ router.get("/", authMiddleware, async (req: AuthRequest, res) => {
           configs: true,
           cargos: { include: { cargo: { select: { id: true, name: true } } } },
           options: { orderBy: { label: "asc" } },
+          selectors: { 
+            include: { options: { orderBy: { order: "asc" } } },
+            orderBy: { order: "asc" }
+          },
+          flowConfig: {
+            include: {
+              approvalCargo: true,
+              triggers: {
+                include: {
+                  triggerOption: true,
+                  triggerSelector: true,
+                  delegateCargo: true,
+                },
+              },
+            },
+          },
         },
       });
       return res.json(questions);
@@ -44,6 +61,10 @@ router.get("/", authMiddleware, async (req: AuthRequest, res) => {
       include: { 
         configs: true,
         options: { orderBy: { label: "asc" } },
+        selectors: { 
+          include: { options: { orderBy: { order: "asc" } } },
+          orderBy: { order: "asc" }
+        },
       },
     });
 
@@ -60,7 +81,7 @@ router.post("/", authMiddleware, async (req: AuthRequest, res) => {
       return res.status(403).json({ error: "Solo admins pueden crear preguntas" });
     }
 
-    const { text, description, configs, order, cargoIds, frequencyType, frequencyDay, frequencyInterval, options, targetType } = req.body;
+    const { text, description, configs, order, cargoIds, frequencyType, frequencyDay, frequencyInterval, options, targetType, flow, selectors } = req.body;
 
     console.log("POST /api/questions - Body received:", JSON.stringify(req.body, null, 2));
 
@@ -72,7 +93,8 @@ router.post("/", authMiddleware, async (req: AuthRequest, res) => {
       return res.status(400).json({ error: "Debes configurar al menos un tipo de archivo" });
     }
 
-    if (!options || !Array.isArray(options) || options.length === 0) {
+    let finalOptions = options;
+    if (!finalOptions || !Array.isArray(finalOptions) || finalOptions.length === 0) {
       return res.status(400).json({ error: "Debes agregar al menos una opción de respuesta con puntaje" });
     }
 
@@ -100,11 +122,13 @@ router.post("/", authMiddleware, async (req: AuthRequest, res) => {
           })),
         },
         options: {
-          create: options.map((opt: any) => ({
+          create: finalOptions.map((opt: any) => ({
             label: opt.label,
             text: opt.text,
             score: parseInt(opt.score, 10) || 0,
             isDefault: opt.isDefault || false,
+            semanticKey: opt.semanticKey || null,
+            isLocked: opt.isLocked || false,
           })),
         },
         ...(cargoIds && Array.isArray(cargoIds) && cargoIds.length > 0 && {
@@ -114,11 +138,135 @@ router.post("/", authMiddleware, async (req: AuthRequest, res) => {
         }),
       },
       include: {
-        configs: true,
-        cargos: { include: { cargo: { select: { id: true, name: true } } } },
-        options: { orderBy: { label: "asc" } },
-      },
-    });
+          configs: true,
+          cargos: { include: { cargo: { select: { id: true, name: true } } } },
+          options: { orderBy: { label: "asc" } },
+          selectors: { 
+            include: { options: { orderBy: { order: "asc" } } },
+            orderBy: { order: "asc" }
+          },
+          flowConfig: {
+            include: {
+              approvalCargo: true,
+              triggers: {
+                include: {
+                  triggerOption: true,
+                  triggerSelector: true,
+                  delegateCargo: true,
+                },
+              },
+            },
+          },
+        },
+      });
+
+    // Crear selectores si existen
+    if (selectors && Array.isArray(selectors) && selectors.length > 0) {
+      for (const sel of selectors) {
+        const createdSelector = await prisma.questionSelector.create({
+          data: {
+            questionId: question.id,
+            selectorKey: sel.selectorKey,
+            label: sel.label,
+            selectorType: sel.selectorType || "YES_NO",
+            renderAs: sel.renderAs || "RADIO",
+            allowsMultiple: sel.allowsMultiple || false,
+            required: sel.required !== false,
+            order: sel.order || 0,
+          },
+        });
+        
+        // Crear opciones del selector
+        if (sel.options && Array.isArray(sel.options)) {
+          for (const opt of sel.options) {
+            await prisma.questionSelectorOption.create({
+              data: {
+                selectorId: createdSelector.id,
+                label: opt.label,
+                text: opt.text,
+                semanticKey: opt.semanticKey || null,
+                order: opt.order || 0,
+              },
+            });
+          }
+        }
+      }
+    }
+
+    if (flow && typeof flow === "object" && flow.isActive) {
+      const flowConfigData: any = {
+        questionId: question.id,
+        isActive: flow.isActive !== false,
+        requiresApproval: flow.requiresApproval || false,
+        approvalCargoId: flow.approvalCargoId ? parseInt(String(flow.approvalCargoId), 10) : null,
+        requiresDelegation: flow.requiresDelegation || false,
+        deadlineOffsetDays: flow.deadlineOffsetDays || 2,
+        deadlineBusinessDays: flow.deadlineBusinessDays || false,
+      };
+
+      const flowConfig = await prisma.questionFlowConfig.create({
+        data: flowConfigData,
+      });
+
+      if (flow.requiresDelegation && Array.isArray(flow.triggers)) {
+        for (const trigger of flow.triggers) {
+          if (trigger.delegateCargoId) {
+            let resolvedSelectorId: number | null = null;
+            if (trigger.triggerSelectorKey && trigger.triggerMode?.startsWith("SELECTOR_")) {
+              const selector = await prisma.questionSelector.findFirst({
+                where: { questionId: question.id, selectorKey: trigger.triggerSelectorKey }
+              });
+              resolvedSelectorId = selector?.id || null;
+            } else if (trigger.triggerSelectorId && !isNaN(parseInt(String(trigger.triggerSelectorId)))) {
+              resolvedSelectorId = parseInt(String(trigger.triggerSelectorId));
+            }
+            
+            await prisma.questionFlowTrigger.create({
+              data: {
+                flowConfigId: flowConfig.id,
+                delegateCargoId: parseInt(String(trigger.delegateCargoId), 10),
+                triggerMode: trigger.triggerMode || "OPTION_SEMANTIC",
+                triggerSemanticKey: trigger.triggerSemanticKey || null,
+                triggerOptionId: trigger.triggerOptionId ? parseInt(String(trigger.triggerOptionId), 10) : null,
+                triggerScore: trigger.triggerScore != null ? parseInt(String(trigger.triggerScore), 10) : null,
+                triggerSelectorId: resolvedSelectorId,
+                triggerSelectorOptionId: trigger.triggerSelectorOptionId ? parseInt(String(trigger.triggerSelectorOptionId), 10) : null,
+                triggerSelectorSemanticKey: trigger.triggerSelectorSemanticKey || null,
+                secondFileType: trigger.secondFileType || "EXCEL",
+                secondFileMaxFiles: trigger.secondFileMaxFiles || 1,
+                secondFileLabel: trigger.secondFileLabel || "Plan de Acción",
+              },
+            });
+          }
+        }
+      }
+      
+      const updatedQuestion = await prisma.question.findUnique({
+        where: { id: question.id },
+        include: {
+          configs: true,
+          cargos: { include: { cargo: { select: { id: true, name: true } } } },
+          options: { orderBy: { label: "asc" } },
+          selectors: { 
+            include: { options: { orderBy: { order: "asc" } } },
+            orderBy: { order: "asc" }
+          },
+          flowConfig: {
+            include: {
+              approvalCargo: true,
+              triggers: {
+                include: {
+                  triggerOption: true,
+                  triggerSelector: true,
+                  delegateCargo: true,
+                },
+              },
+            },
+          },
+        },
+      });
+      return res.status(201).json(updatedQuestion);
+    }
 
     res.status(201).json(question);
   } catch (error: any) {
@@ -137,9 +285,9 @@ router.put("/:id", authMiddleware, async (req: AuthRequest, res) => {
     }
 
     const { id } = req.params;
-    const { text, description, configs, order, isActive, cargoIds, frequencyType, frequencyDay, frequencyInterval, options, targetType } = req.body;
+    const { text, description, configs, order, isActive, cargoIds, frequencyType, frequencyDay, frequencyInterval, options, targetType, flow, selectors } = req.body;
     console.log("PUT /api/questions/:id - Body received:", JSON.stringify(req.body, null, 2));
-    const questionId = parseInt(id);
+    const questionId = parseId(id);
 
     if (isNaN(questionId)) {
       return res.status(400).json({ error: "ID de pregunta inválido" });
@@ -182,6 +330,8 @@ router.put("/:id", authMiddleware, async (req: AuthRequest, res) => {
             text: opt.text,
             score: parseInt(opt.score, 10) || 0,
             isDefault: opt.isDefault || false,
+            semanticKey: opt.semanticKey || null,
+            isLocked: opt.isLocked || false,
           })),
         });
       }
@@ -200,11 +350,190 @@ router.put("/:id", authMiddleware, async (req: AuthRequest, res) => {
         ...(parsedTarget !== undefined && { targetType: parsedTarget }),
       },
       include: {
-        configs: true,
-        cargos: { include: { cargo: { select: { id: true, name: true } } } },
-        options: { orderBy: { label: "asc" } },
-      },
-    });
+          configs: true,
+          cargos: { include: { cargo: { select: { id: true, name: true } } } },
+          options: { orderBy: { label: "asc" } },
+          selectors: { 
+            include: { options: { orderBy: { order: "asc" } } },
+            orderBy: { order: "asc" }
+          },
+          flowConfig: {
+            include: {
+              approvalCargo: true,
+              triggers: {
+                include: {
+                  triggerOption: true,
+                  triggerSelector: true,
+                  delegateCargo: true,
+                },
+              },
+            },
+          },
+        },
+      });
+
+    // Actualizar selectores si se proporcionan
+    if (selectors !== undefined) {
+      await prisma.questionSelectorOption.deleteMany({
+        where: { selector: { questionId } },
+      });
+      await prisma.questionSelector.deleteMany({ where: { questionId } });
+      
+      if (Array.isArray(selectors) && selectors.length > 0) {
+        for (const sel of selectors) {
+          const createdSelector = await prisma.questionSelector.create({
+            data: {
+              questionId,
+              selectorKey: sel.selectorKey,
+              label: sel.label,
+              selectorType: sel.selectorType || "YES_NO",
+              renderAs: sel.renderAs || "RADIO",
+              allowsMultiple: sel.allowsMultiple || false,
+              required: sel.required !== false,
+              order: sel.order || 0,
+            },
+          });
+          
+          if (sel.options && Array.isArray(sel.options)) {
+            for (const opt of sel.options) {
+              await prisma.questionSelectorOption.create({
+                data: {
+                  selectorId: createdSelector.id,
+                  label: opt.label,
+                  text: opt.text,
+                  semanticKey: opt.semanticKey || null,
+                  order: opt.order || 0,
+                },
+              });
+            }
+          }
+        }
+      }
+    }
+
+    if (flow && typeof flow === "object") {
+      const existingFlow = await prisma.questionFlowConfig.findUnique({ where: { questionId } });
+      
+      if (existingFlow) {
+        await prisma.questionFlowConfig.update({
+          where: { questionId },
+          data: {
+            isActive: flow.isActive !== false,
+            requiresApproval: flow.requiresApproval || false,
+            approvalCargoId: flow.approvalCargoId ? parseInt(String(flow.approvalCargoId), 10) : null,
+            requiresDelegation: flow.requiresDelegation || false,
+            deadlineOffsetDays: flow.deadlineOffsetDays || 2,
+            deadlineBusinessDays: flow.deadlineBusinessDays || false,
+          },
+        });
+
+        if (flow.requiresDelegation && Array.isArray(flow.triggers)) {
+          await prisma.questionFlowTrigger.deleteMany({ where: { flowConfigId: existingFlow.id } });
+          
+          for (const trigger of flow.triggers) {
+            if (trigger.delegateCargoId) {
+              let resolvedSelectorId: number | null = null;
+              if (trigger.triggerSelectorKey && trigger.triggerMode?.startsWith("SELECTOR_")) {
+                const selector = await prisma.questionSelector.findFirst({
+                  where: { questionId, selectorKey: trigger.triggerSelectorKey }
+                });
+                resolvedSelectorId = selector?.id || null;
+              } else if (trigger.triggerSelectorId && !isNaN(parseInt(String(trigger.triggerSelectorId)))) {
+                resolvedSelectorId = parseInt(String(trigger.triggerSelectorId));
+              }
+              
+              await prisma.questionFlowTrigger.create({
+                data: {
+                  flowConfigId: existingFlow.id,
+                  delegateCargoId: parseInt(String(trigger.delegateCargoId), 10),
+                  triggerMode: trigger.triggerMode || "OPTION_SEMANTIC",
+                  triggerSemanticKey: trigger.triggerSemanticKey || null,
+                  triggerOptionId: trigger.triggerOptionId ? parseInt(String(trigger.triggerOptionId), 10) : null,
+                  triggerScore: trigger.triggerScore != null ? parseInt(String(trigger.triggerScore), 10) : null,
+                  triggerSelectorId: resolvedSelectorId,
+                  triggerSelectorOptionId: trigger.triggerSelectorOptionId ? parseInt(String(trigger.triggerSelectorOptionId), 10) : null,
+                  triggerSelectorSemanticKey: trigger.triggerSelectorSemanticKey || null,
+                  secondFileType: trigger.secondFileType || "EXCEL",
+                  secondFileMaxFiles: trigger.secondFileMaxFiles || 1,
+                  secondFileLabel: trigger.secondFileLabel || "Plan de Acción",
+                },
+              });
+            }
+          }
+        }
+      } else if (flow.isActive) {
+        const flowConfig = await prisma.questionFlowConfig.create({
+          data: {
+            questionId,
+            isActive: true,
+            requiresApproval: flow.requiresApproval || false,
+            approvalCargoId: flow.approvalCargoId ? parseInt(String(flow.approvalCargoId), 10) : null,
+            requiresDelegation: flow.requiresDelegation || false,
+            deadlineOffsetDays: flow.deadlineOffsetDays || 2,
+            deadlineBusinessDays: flow.deadlineBusinessDays || false,
+          },
+        });
+
+        if (flow.requiresDelegation && Array.isArray(flow.triggers)) {
+          for (const trigger of flow.triggers) {
+            if (trigger.delegateCargoId) {
+              let resolvedSelectorId: number | null = null;
+              if (trigger.triggerSelectorKey && trigger.triggerMode?.startsWith("SELECTOR_")) {
+                const selector = await prisma.questionSelector.findFirst({
+                  where: { questionId, selectorKey: trigger.triggerSelectorKey }
+                });
+                resolvedSelectorId = selector?.id || null;
+              } else if (trigger.triggerSelectorId && !isNaN(parseInt(String(trigger.triggerSelectorId)))) {
+                resolvedSelectorId = parseInt(String(trigger.triggerSelectorId));
+              }
+              
+              await prisma.questionFlowTrigger.create({
+                data: {
+                  flowConfigId: flowConfig.id,
+                  delegateCargoId: parseInt(String(trigger.delegateCargoId), 10),
+                  triggerMode: trigger.triggerMode || "OPTION_SEMANTIC",
+                  triggerSemanticKey: trigger.triggerSemanticKey || null,
+                  triggerOptionId: trigger.triggerOptionId ? parseInt(String(trigger.triggerOptionId), 10) : null,
+                  triggerScore: trigger.triggerScore != null ? parseInt(String(trigger.triggerScore), 10) : null,
+                  triggerSelectorId: resolvedSelectorId,
+                  triggerSelectorOptionId: trigger.triggerSelectorOptionId ? parseInt(String(trigger.triggerSelectorOptionId), 10) : null,
+                  triggerSelectorSemanticKey: trigger.triggerSelectorSemanticKey || null,
+                  secondFileType: trigger.secondFileType || "EXCEL",
+                  secondFileMaxFiles: trigger.secondFileMaxFiles || 1,
+                  secondFileLabel: trigger.secondFileLabel || "Plan de Acción",
+                },
+              });
+            }
+          }
+        }
+      }
+
+      const updatedQuestion = await prisma.question.findUnique({
+        where: { id: questionId },
+        include: {
+          configs: true,
+          cargos: { include: { cargo: { select: { id: true, name: true } } } },
+          options: { orderBy: { label: "asc" } },
+          selectors: { 
+            include: { options: { orderBy: { order: "asc" } } },
+            orderBy: { order: "asc" }
+          },
+          flowConfig: {
+            include: {
+              approvalCargo: true,
+              triggers: {
+                include: {
+                  triggerOption: true,
+                  triggerSelector: true,
+                  delegateCargo: true,
+                },
+              },
+            },
+          },
+        },
+      });
+      return res.json(updatedQuestion);
+    }
 
     res.json(question);
   } catch (error: any) {
@@ -224,7 +553,7 @@ router.delete("/:id", authMiddleware, async (req: AuthRequest, res) => {
     const { id } = req.params;
 
     await prisma.question.update({
-      where: { id: parseInt(id) },
+      where: { id: parseId(id) },
       data: { isActive: false },
     });
 

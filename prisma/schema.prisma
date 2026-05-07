@@ -33,6 +33,9 @@ model Cargo {
   isActive  Boolean  @default(true)
   users     User[]
   questions QuestionCargo[]
+  flowApprovals       QuestionFlowConfig[]  @relation("FlowApproval")
+  flowTriggers        QuestionFlowTrigger[] @relation("FlowDelegation")
+  answerApprovals     AnswerApproval[]      @relation("ApprovalCargo")
 }
 
 model User {
@@ -53,6 +56,9 @@ model User {
   campaigns     CampaignUser[]
   programs      UserProgram[]
   answersReviewed Answer[]  @relation("AnswerReviewer")
+  delegationsCompleted AnswerDelegation[] @relation("DelegationCompleter")
+  approvalsDecided     AnswerApproval[]   @relation("ApprovalDecider")
+  uploadedFiles        AnswerFile[]        @relation("FileUploader")
 }
 
 model Campaign {
@@ -99,7 +105,9 @@ model Question {
   cargos            QuestionCargo[]
   submissions       QuestionSubmission[]
   options           QuestionOption[]
+  selectors         QuestionSelector[]
   programs          QuestionProgram[]
+  flowConfig        QuestionFlowConfig?
 }
 
 model QuestionCargo {
@@ -119,10 +127,52 @@ model QuestionOption {
   text        String   // Texto de la opción
   score       Int      // Puntaje asignado a esta opción
   isDefault   Boolean  @default(false) // Indica si es la opción por defecto
+  semanticKey String?
+  isLocked    Boolean  @default(false)
   question    Question @relation(fields: [questionId], references: [id], onDelete: Cascade)
   answers     Answer[]
+  flowTriggers QuestionFlowTrigger[]
 
   @@unique([questionId, label])
+  @@unique([questionId, semanticKey])
+}
+
+model QuestionSelector {
+  id              Int      @id @default(autoincrement())
+  questionId       Int
+  question        Question @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  selectorKey     String   // identificador único dentro de la pregunta ("requires_plan", "evidencia_presencial")
+  label           String   // texto mostrado al usuario
+  selectorType    String   // YES_NO | YES_NO_NA | CUSTOM | COMPLIANCE | SCALE_1_5
+  renderAs        String   // RADIO | BUTTONS | SELECT | CHECKBOX
+  allowsMultiple  Boolean  @default(false)
+  required       Boolean  @default(true)
+  order          Int      @default(0)
+  options        QuestionSelectorOption[]
+  flowTriggers  QuestionFlowTrigger[]
+
+  @@unique([questionId, selectorKey])
+}
+
+model QuestionSelectorOption {
+  id            Int               @id @default(autoincrement())
+  selectorId    Int
+  selector      QuestionSelector  @relation(fields: [selectorId], references: [id], onDelete: Cascade)
+  label         String            // "A", "B", "Sí"
+  text          String
+  semanticKey   String?          // YES, NO, NA, COMPLIANT...
+  order         Int              @default(0)
+}
+
+model EvaluationAnswerSelector {
+  id                Int      @id @default(autoincrement())
+  answerId          Int
+  answer            Answer   @relation(fields: [answerId], references: [id], onDelete: Cascade)
+  selectorId        Int
+  selectedOptionIds  Int[]
+  createdAt        DateTime @default(now())
+
+  @@unique([answerId, selectorId])
 }
 
 model QuestionConfig {
@@ -163,9 +213,14 @@ model Answer {
   evaluationId   Int
   questionId     Int
   optionId       Int?       // Opción seleccionada por el usuario
+  optionIds      Int[]
+  detailText     String?
   awardedScore   Int        @default(0)
   hasEvidence    Boolean    @default(false)
+  status         String     @default("ANSWERED") // DRAFT | ANSWERED | PENDING_DELEGATION | PENDING_APPROVAL | COMPLETED | EXPIRED
+  completedAt    DateTime?
   createdAt      DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
   // Campos de período (según frecuencia de pregunta)
   periodStart    DateTime?  // Inicio del período (ej: lunes de la semana)
   periodEnd      DateTime?  // Fin del período (ej: domingo)
@@ -179,7 +234,10 @@ model Answer {
   question       Question   @relation(fields: [questionId], references: [id])
   option         QuestionOption? @relation(fields: [optionId], references: [id])
   files          AnswerFile[]
+  selectorResponses EvaluationAnswerSelector[]
   reviewedBy     User?      @relation("AnswerReviewer", fields: [reviewedById], references: [id])
+  delegation    AnswerDelegation?
+  approval      AnswerApproval?
 
   @@unique([evaluationId, questionId, periodStart])
 }
@@ -190,8 +248,11 @@ model AnswerFile {
   fileType    String   // IMAGEN, PDF, PPT, EXCEL
   fileName    String
   fileUrl     String
+  phase      String   @default("RESPONDER")   // RESPONDER | DELEGATE
+  uploadedByUserId  Int?
   createdAt   DateTime @default(now())
   answer      Answer   @relation(fields: [answerId], references: [id], onDelete: Cascade)
+  uploadedBy  User?    @relation("FileUploader", fields: [uploadedByUserId], references: [id])
 }
 
 // Registra cuándo se respondió cada pregunta (para control de frecuencia)
@@ -271,4 +332,99 @@ model MonthlyRecord {
   config      ProgramFileConfig @relation(fields: [configId], references: [id], onDelete: Cascade)
 
   @@unique([configId, period])
+}
+
+// ==================== FLUJO DE PREGUNTAS: APROBACIÓN + DELEGACIÓN ====================
+
+// Configuración de flujo por pregunta (singleton)
+model QuestionFlowConfig {
+  id                     Int       @id @default(autoincrement())
+  questionId             Int       @unique
+  isActive               Boolean   @default(true)
+
+  // --- APROBACIÓN ---
+  requiresApproval       Boolean   @default(false)
+  approvalCargoId        Int?
+
+  // --- DELEGACIÓN (parámetros globales; los triggers viven en tabla hija) ---
+  requiresDelegation     Boolean   @default(false)
+  deadlineOffsetDays     Int       @default(2)
+  deadlineBusinessDays   Boolean   @default(false)
+
+  createdAt              DateTime  @default(now())
+  updatedAt              DateTime  @updatedAt
+
+  question               Question              @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  approvalCargo          Cargo?                @relation("FlowApproval", fields: [approvalCargoId], references: [id], onDelete: SetNull)
+  triggers               QuestionFlowTrigger[]
+
+  @@index([isActive])
+}
+
+// Triggers de delegación: N por config
+model QuestionFlowTrigger {
+  id                     Int       @id @default(autoincrement())
+  flowConfigId           Int
+  delegateCargoId        Int
+
+  triggerMode            String    @default("OPTION_SEMANTIC") // OPTION_SEMANTIC | OPTION_ID | SCORE_LTE | SCORE_GTE | ALWAYS | SELECTOR_OPTION | SELECTOR_SEMANTIC
+  triggerSemanticKey     String?
+  triggerOptionId        Int?                            // usado si mode = OPTION_ID
+  triggerScore           Int?                            // usado si mode = SCORE_LTE / SCORE_GTE
+  // Nuevos campos para selectores
+  triggerSelectorId        Int?                            // usado si mode = SELECTOR_OPTION | SELECTOR_SEMANTIC
+  triggerSelectorOptionId Int?                         // usado si mode = SELECTOR_OPTION
+  triggerSelectorSemanticKey String?                   // usado si mode = SELECTOR_SEMANTIC
+
+  secondFileType         String    @default("EXCEL")     // IMAGEN / PDF / PPT / EXCEL
+  secondFileMaxFiles     Int       @default(1)
+  secondFileLabel        String    @default("Plan de Acción")
+
+  flowConfig             QuestionFlowConfig @relation(fields: [flowConfigId], references: [id], onDelete: Cascade)
+  triggerOption          QuestionOption?    @relation(fields: [triggerOptionId], references: [id], onDelete: Cascade)
+  triggerSelector      QuestionSelector? @relation(fields: [triggerSelectorId], references: [id], onDelete: Cascade)
+  delegateCargo          Cargo              @relation("FlowDelegation", fields: [delegateCargoId], references: [id])
+  delegations            AnswerDelegation[]
+
+  @@unique([flowConfigId, triggerOptionId])
+  @@unique([flowConfigId, triggerSemanticKey])
+  @@index([delegateCargoId])
+}
+
+// Instancia de delegación (una por Answer gatilladora)
+model AnswerDelegation {
+  id                Int       @id @default(autoincrement())
+  answerId          Int       @unique
+  triggerId         Int
+  deadlineAt        DateTime
+  status            String    @default("PENDIENTE")     // PENDIENTE | COMPLETADO | VENCIDO | CANCELADA
+  completedAt       DateTime?
+  completedByUserId Int?
+  cancelledAt       DateTime?
+  isLate            Boolean   @default(false)
+  createdAt         DateTime  @default(now())
+
+  answer            Answer              @relation(fields: [answerId], references: [id], onDelete: Cascade)
+  trigger           QuestionFlowTrigger @relation(fields: [triggerId], references: [id])
+  completedBy       User?               @relation("DelegationCompleter", fields: [completedByUserId], references: [id])
+
+  @@index([status, deadlineAt])
+}
+
+// Instancia de aprobación (una por Answer que requiere aprobación)
+model AnswerApproval {
+  id              Int       @id @default(autoincrement())
+  answerId        Int       @unique
+  approverCargoId Int
+  status          String    @default("PENDIENTE")       // PENDIENTE | APROBADA | RECHAZADA
+  decidedAt       DateTime?
+  decidedByUserId Int?
+  comment         String?
+  createdAt       DateTime  @default(now())
+
+  answer          Answer    @relation(fields: [answerId], references: [id], onDelete: Cascade)
+  approverCargo   Cargo     @relation("ApprovalCargo", fields: [approverCargoId], references: [id])
+  decidedBy       User?     @relation("ApprovalDecider", fields: [decidedByUserId], references: [id])
+
+  @@index([status, approverCargoId])
 }

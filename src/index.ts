@@ -38,6 +38,8 @@ import fs from "fs";
 import multer from "multer";
 
 import programFilesRoutes from "./routes/programFiles.ts";
+import delegationsRoutes from "./routes/delegations.ts";
+import approvalsRoutes from "./routes/approvals.ts";
 
 const uploadsDir = path.join(process.cwd(), "uploads");
 if (!fs.existsSync(uploadsDir)) {
@@ -45,6 +47,8 @@ if (!fs.existsSync(uploadsDir)) {
 }
 
 app.use("/api/program-files", programFilesRoutes);
+app.use("/api/delegations", delegationsRoutes);
+app.use("/api/approvals", approvalsRoutes);
 
 app.use("/uploads", express.static(uploadsDir));
 

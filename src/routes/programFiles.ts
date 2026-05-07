@@ -7,10 +7,18 @@ import ExcelJS from "exceljs";
 const router = Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } });
 
-const parseId = (param: string): number => {
-  const id = parseInt(param, 10);
+const parseId = (param: string | string[] | undefined): number => {
+  const val = Array.isArray(param) ? param[0] : param;
+  if (!val) throw new Error("ID inválido");
+  const id = parseInt(val, 10);
   if (isNaN(id)) throw new Error("ID inválido");
   return id;
+};
+
+const paramStr = (param: string | string[] | undefined): string => {
+  if (!param) return "";
+  if (Array.isArray(param)) return String(param[0]);
+  return param;
 };
 
 // ==================== HELPERS PARA EXCEL ====================
@@ -130,8 +138,9 @@ interface RegistroRuta {
   status_brevete: string | null;
 }
 
-async function parseExcelRuta(buffer: Buffer, period: string): Promise<RegistroRuta[]> {
+async function parseExcelRuta(buffer: Buffer | Uint8Array | ArrayBuffer, period: string): Promise<RegistroRuta[]> {
   const workbook = new ExcelJS.Workbook();
+  // @ts-ignore - ExcelJS accepts Uint8Array but types don't match
   await workbook.xlsx.load(buffer);
   const sheet = workbook.worksheets[0];
 
@@ -257,6 +266,7 @@ router.post("/:programId/upload-template", authMiddleware, upload.single("file")
     }
 
     const workbook = new ExcelJS.Workbook();
+    // @ts-ignore - ExcelJS accepts Uint8Array but types don't match
     await workbook.xlsx.load(file.buffer);
     const sheet = workbook.worksheets[0];
 
@@ -416,7 +426,7 @@ router.get("/:programId/records/latest", authMiddleware, async (req: AuthRequest
 router.get("/:programId/records/:period", authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
     const programId = parseId(req.params.programId);
-    const { period } = req.params;
+    const period = paramStr(req.params.period);
 
     const config = await prisma.programFileConfig.findUnique({ where: { programId } });
     if (!config) {
@@ -441,7 +451,7 @@ router.patch("/:programId/records/:period/ajuste", authMiddleware, async (req: A
     }
 
     const programId = parseId(req.params.programId);
-    const { period } = req.params;
+    const period = paramStr(req.params.period);
     const { numero, campo, nuevoValor } = req.body;
 
     const config = await prisma.programFileConfig.findUnique({ where: { programId } });
@@ -489,7 +499,7 @@ router.post("/:programId/records/:period", authMiddleware, async (req: AuthReque
     }
 
     const programId = parseId(req.params.programId);
-    const { period } = req.params;
+    const period = paramStr(req.params.period);
     const { data, status, source } = req.body;
 
     const config = await prisma.programFileConfig.findUnique({ where: { programId } });
@@ -529,7 +539,7 @@ router.post("/:programId/records/:period/import", authMiddleware, upload.single(
     }
 
     const programId = parseId(req.params.programId);
-    const { period } = req.params;
+    const period = paramStr(req.params.period);
     const file = req.file;
 
     if (!file) {
@@ -619,7 +629,7 @@ router.get("/:programId/pending-status", authMiddleware, async (req: AuthRequest
 router.get("/:programId/records/:period/summary", authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
     const programId = parseId(req.params.programId);
-    const { period } = req.params;
+    const period = paramStr(req.params.period);
 
     const config = await prisma.programFileConfig.findUnique({ where: { programId } });
     if (!config) {
@@ -634,7 +644,7 @@ router.get("/:programId/records/:period/summary", authMiddleware, async (req: Au
       return res.json(null);
     }
 
-    const data = record.data as { registros: RegistroRuta[] };
+    const data = record.data as unknown as { registros: RegistroRuta[] };
     const regs = data.registros || [];
 
     res.json({
